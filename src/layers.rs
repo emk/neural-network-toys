@@ -1,7 +1,8 @@
 use std::fmt::Debug;
 
-use ndarray::{Array1, Array2};
-use ndarray_rand::{rand_distr::Uniform, RandomExt};
+use ndarray::{Array1, Array2, s};
+use ndarray_rand::{rand_distr::Uniform, RandomExt, rand::seq::SliceRandom};
+
 
 /// [Xavier][] initialization is a good default for initializing weights in a
 /// layer, with the [exception][] of layers using ReLU or SELU activations.
@@ -84,11 +85,29 @@ pub trait Layer: Debug + Send + Sync + 'static {
     /// Perform the foward pass through this layer, returning the output.
     fn forward(&self, input: &Array1<f64>) -> Array1<f64>;
 
-    /// An appropriate loss function for this layer.
-    fn loss(&self, output: &Array1<f64>, target: &Array1<f64>) -> f64;
+    /// An appropriate loss function for this layer. By default, this is mean
+    /// squared error, but it can be overridden for particular layers.
+    fn loss(&self, output: &Array1<f64>, target: &Array1<f64>) -> f64 {
+        // Mean squared error.
+        let diff = output - target;
+        diff.dot(&diff) / output.len() as f64
+    }
 
     /// The derivative of the loss function with respect to the output.
-    fn dloss_doutput(&self, output: &Array1<f64>, target: &Array1<f64>) -> Array1<f64>;
+    fn dloss_doutput(&self, output: &Array1<f64>, target: &Array1<f64>) -> Array1<f64> {
+        // loss          = 1/n * (output - target)^2
+        // ∂loss/∂output = 2/n * (output - target)
+        (2.0 / output.len() as f64) * (output - target)
+    }
+
+    /// Prepare this layer for a training step. This is normally a no-op, but
+    /// dropout layers will use this to decide which neurons to drop.
+    fn start_training_step(&mut self) {}
+
+    /// Reset this layer to normal after a training step. This is normally a
+    /// no-op, but dropout layers will use this to restore the weights of
+    /// dropped neurons.
+    fn end_training_step(&mut self) {}
 
     /// Update the weights and biases of this layer, and return `dloss_dinput`.
     fn update(
@@ -135,18 +154,6 @@ impl TanhLayer {
 impl Layer for TanhLayer {
     fn forward(&self, input: &Array1<f64>) -> Array1<f64> {
         self.fully_connected.forward(input).mapv(|x| x.tanh())
-    }
-
-    fn loss(&self, output: &Array1<f64>, target: &Array1<f64>) -> f64 {
-        // Mean squared error.
-        let diff = output - target;
-        diff.dot(&diff) / output.len() as f64
-    }
-
-    fn dloss_doutput(&self, output: &Array1<f64>, target: &Array1<f64>) -> Array1<f64> {
-        // loss          = 1/n * (output - target)^2
-        // ∂loss/∂output = 2/n * (output - target)
-        (2.0 / output.len() as f64) * (output - target)
     }
 
     fn update(
@@ -275,6 +282,67 @@ impl LayerWeightsAndBiases for SoftmaxLayer {
     }
 }
 
+/// A layer that implments [dropout][] by randomly setting some of its inputs to
+/// zero, to help prevent overfitting. This is only used during training.
+///
+/// [dropout]: https://www.cs.toronto.edu/~hinton/absps/JMLRdropout.pdf
+#[derive(Debug, Clone)]
+pub struct DropoutLayer {
+    /// The probability of keeping an input.
+    keep_probability: f64,
+
+    /// The mask used to drop inputs. Kept neurons have a value of 1.0, and
+    /// dropped neurons have a value of 0.0.
+    mask: Array1<f64>,
+}
+
+impl DropoutLayer {
+    /// Create a new `DropoutLayer` with the given keep probability.
+    pub fn new(width: usize, keep_probability: f64) -> Self {
+        Self {
+            keep_probability,
+            mask: Array1::ones(width),
+        }
+    }
+}
+
+impl Layer for DropoutLayer {
+    fn forward(&self, input: &Array1<f64>) -> Array1<f64> {
+        input * &self.mask
+    }
+
+    /// Randomize our mask for training.
+    fn start_training_step(&mut self) {
+        // We need to scale the mask, so that the expected value of the output
+        // is the same as if we hadn't used dropout.
+        let scaled = 1.0 / self.keep_probability;
+
+        // We do this by setting exactly `keep_probability * width` values to 1.0,
+        // and the rest to 0.0. Then we shuffle the array.
+        let keep_count = (self.keep_probability * self.mask.len() as f64).round() as usize;
+        self.mask.slice_mut(s![0..keep_count]).fill(scaled);
+        self.mask.slice_mut(s![keep_count..]).fill(0.0);
+        self.mask.as_slice_mut().unwrap().shuffle(&mut rand::thread_rng());
+    }
+
+    /// Reset our mask after a training step, for testing and inference.
+    fn end_training_step(&mut self) {
+        self.mask.fill(1.0);
+    }
+
+    fn update(
+        &mut self,
+        _input: &Array1<f64>,
+        dloss_doutput: &Array1<f64>,
+        _learning_rate: f64,
+    ) -> Array1<f64> {
+        // See https://deepnotes.io/dropout for a discussion of gradients and
+        // dropout. Since we're scaling the output by the keep probability,
+        // I guess we need to scale the gradient by the same amount?
+        dloss_doutput * &self.mask
+    }
+}
+
 /// A neural network.
 #[derive(Debug)]
 pub struct Network {
@@ -321,7 +389,12 @@ impl Network {
 
     /// Given an input and a target output, update the network's weights and
     /// biases, and return the loss.
-    pub fn update(&mut self, input: &Array1<f64>, target: &Array1<f64>, learning_rate: f64) -> f64 {
+    pub fn update(&mut self, input: &Array1<f64>, target: &Array1<f64>, learning_rate: f64) {
+        // Start training on all layers.
+        for layer in &mut self.layers {
+            layer.start_training_step();
+        }
+
         // Forward pass.
         let mut output = input.clone();
         let mut outputs = vec![output.clone()];
@@ -336,7 +409,10 @@ impl Network {
             dloss_doutput = layer.update(&output, &dloss_doutput, learning_rate);
         }
 
-        self.loss(&output, &target)
+        // End training on all layers.
+        for layer in &mut self.layers {
+            layer.end_training_step();
+        }
     }
 }
 

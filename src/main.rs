@@ -23,7 +23,7 @@ use rand::seq::SliceRandom;
 
 mod layers;
 
-use crate::layers::{Network, SoftmaxLayer, TanhLayer};
+use crate::layers::{DropoutLayer, Network, SoftmaxLayer, TanhLayer};
 
 #[derive(Debug, Parser)]
 #[structopt(
@@ -55,12 +55,15 @@ struct TrainOpt {
     #[arg(long = "learning-rate", default_value = "0.01")]
     learning_rate: f64,
 
+    #[arg(long = "dropout", default_value = "0.5")]
+    dropout: f64,
+
     /// Input layer size.
     #[arg(long = "input-size", default_value = "4")]
     input_size: usize,
 
-    /// Hidden layer size.
-    #[arg(long = "hidden-size", default_value = "7")]
+    /// Hidden layer size. This needs to be adjusted if you change the dropout.
+    #[arg(long = "hidden-size", default_value = "14")]
     hidden_size: usize,
 
     /// Output layer size.
@@ -95,6 +98,7 @@ fn train(opt: TrainOpt) -> Result<()> {
     );
 
     let mut network = Network::new(TanhLayer::new(opt.input_size, opt.hidden_size));
+    network.add_layer(DropoutLayer::new(opt.hidden_size, 1.0-opt.dropout));
     network.add_layer(SoftmaxLayer::new(opt.hidden_size, opt.output_size));
 
     for epoch in 0..opt.epochs {
@@ -102,9 +106,10 @@ fn train(opt: TrainOpt) -> Result<()> {
         let mut train_loss = 0.0;
         let mut train_correct = 0;
         for (input, target) in &train {
-            let loss = network.update(input, target, opt.learning_rate);
-            assert!(loss.is_finite(), "loss is not finite: {}", loss);
+            network.update(input, target, opt.learning_rate);
             let output = network.forward(input);
+            let loss = network.loss(&output, target);
+            assert!(loss.is_finite(), "loss is not finite: {}", loss);
             train_loss += loss;
             if predicted_class_index(&output) == predicted_class_index(target) {
                 train_correct += 1;
