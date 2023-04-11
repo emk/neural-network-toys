@@ -19,6 +19,8 @@ use clap::{Parser, Subcommand};
 use csv;
 use log::debug;
 use ndarray::Array1;
+use plotters::{prelude::{ChartBuilder, IntoDrawingArea, PathElement}, style::{WHITE, IntoFont, RED, BLUE, BLACK, Color}, series::LineSeries};
+use plotters_svg::SVGBackend;
 use rand::seq::SliceRandom;
 
 mod layers;
@@ -70,6 +72,10 @@ struct TrainOpt {
     #[arg(long = "output-size", default_value = "3")]
     output_size: usize,
 
+    /// Path to save plot of training and test loss.
+    #[arg(long = "plot")]
+    plot: Option<PathBuf>,
+
     /// Path to the data file.
     data: PathBuf,
 
@@ -90,7 +96,7 @@ fn main() -> Result<()> {
 /// First attempt at a training function, written largely by Copilot.
 fn train(opt: TrainOpt) -> Result<()> {
     let data = read_data(&opt.data)?;
-    let (train, test) = split_data(&data, opt.split);
+    let (mut train, test) = split_data(&data, opt.split);
     eprintln!(
         "Training data: {} examples, test data: {} examples",
         train.len(),
@@ -101,10 +107,16 @@ fn train(opt: TrainOpt) -> Result<()> {
     network.add_layer(DropoutLayer::new(opt.hidden_size, 1.0-opt.dropout));
     network.add_layer(SoftmaxLayer::new(opt.hidden_size, opt.output_size));
 
+    let mut epoch_training_losses = Vec::new();
+    let mut epoch_test_losses = Vec::new();
+
+    let mut rng = rand::thread_rng();
     for epoch in 0..opt.epochs {
         debug!("Model: {:#?}", network);
         let mut train_loss = 0.0;
         let mut train_correct = 0;
+
+        train.shuffle(&mut rng);
         for (input, target) in &train {
             network.update(input, target, opt.learning_rate);
             let output = network.forward(input);
@@ -129,6 +141,9 @@ fn train(opt: TrainOpt) -> Result<()> {
         }
         test_loss /= test.len() as f64;
 
+        epoch_training_losses.push(train_loss);
+        epoch_test_losses.push(test_loss);
+
         eprintln!(
             "Epoch {}: train loss = {:.4} ({}/{}), test loss = {:.4} ({} / {})",
             epoch,
@@ -139,6 +154,11 @@ fn train(opt: TrainOpt) -> Result<()> {
             test_correct,
             test.len(),
         );
+    }
+
+    // Optionally plot the training and test loss.
+    if let Some(plot_path) = opt.plot {
+        plot_loss(&plot_path, &epoch_training_losses, &epoch_test_losses)?;
     }
 
     // TODO: Reimplement `Network::save`.
@@ -210,4 +230,54 @@ fn predicted_class_index(output: &Array1<f64>) -> usize {
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .unwrap()
         .0
+}
+
+/// Use `plotters` to plot the training and test losses for each epoch as an
+/// SVG and save it to `path`. Almost entirely written by Copilot.
+fn plot_loss(
+    path: &Path,
+    training_losses: &[f64],
+    test_losses: &[f64],
+) -> Result<()> {
+    let root = SVGBackend::new(path, (640, 480)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Loss", ("sans-serif", 50).into_font())
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(40)
+        .build_cartesian_2d(0.0f64..training_losses.len() as f64, 0.0f64..1.0f64)?;
+
+    chart
+        .configure_mesh()
+        .disable_x_mesh()
+        .disable_y_mesh()
+        .x_desc("Epoch")
+        .y_desc("Loss")
+        .draw()?;
+
+    chart
+        .draw_series(LineSeries::new(
+            training_losses.iter().enumerate().map(|(x, y)| (x as f64, *y)),
+            &RED,
+        ))?
+        .label("Training")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+
+    chart
+        .draw_series(LineSeries::new(
+            test_losses.iter().enumerate().map(|(x, y)| (x as f64, *y)),
+            &BLUE,
+        ))?
+        .label("Test")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+
+    chart
+        .configure_series_labels()
+        .border_style(&BLACK)
+        .background_style(&WHITE.mix(0.8))
+        .draw()?;
+
+    Ok(())
 }
