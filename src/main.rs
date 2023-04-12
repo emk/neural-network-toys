@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use csv;
+use layers::LeakyReluLayer;
 use log::debug;
 use mnist::MnistBuilder;
 use ndarray::{Array1, Array2, ArrayView1};
@@ -65,6 +66,10 @@ struct TrainOpt {
     /// This is a good way to reduce overfitting.
     #[arg(long = "dropout", default_value = "0.5")]
     dropout: f32,
+
+    /// Leaky ReLU alpha.
+    #[arg(long = "relu-leak", default_value = "0.01")]
+    relu_leak: f32,
 
     /// How long should we wait before stopping training? If we see this many
     /// models in a row that are worse than our best model, we'll stop.
@@ -174,11 +179,16 @@ fn train_mnist(opt: MnistOpt) -> Result<()> {
         test_targets: array2_f32_from_vec_u8(mnist.tst_lbl, num_digits),
     };
 
-    let mut network = Network::new(TanhLayer::new(img_size, opt.hidden_layer_width));
+    let mut network = Network::new(LeakyReluLayer::new(
+        img_size,
+        opt.hidden_layer_width,
+        opt.train.relu_leak,
+    ));
     for _ in 1..opt.hidden_layers {
-        network.add_layer(TanhLayer::new(
+        network.add_layer(LeakyReluLayer::new(
             opt.hidden_layer_width,
             opt.hidden_layer_width,
+            opt.train.relu_leak,
         ));
         network.add_layer(DropoutLayer::new(
             opt.hidden_layer_width,
@@ -209,7 +219,7 @@ fn train(
 ) -> Result<()> {
     let mut history = TrainingHistory::new();
     let mut rng = rand::thread_rng();
-    for epoch in 0..opt.epochs {
+    'epochs: for epoch in 0..opt.epochs {
         debug!("Model: {:#?}", network);
         let mut train_loss = 0.0;
         let mut train_correct = 0;
@@ -227,7 +237,10 @@ fn train(
             network.update(&input, &target, opt.learning_rate);
             let output = network.forward(&input);
             let loss = network.loss(&output.view(), &target);
-            assert!(loss.is_finite(), "loss is not finite: {}", loss);
+            if !loss.is_finite() {
+                eprintln!("Loss is not finite: {}", loss);
+                break 'epochs;
+            }
             train_loss += loss;
             if predicted_class_index(&output.view()) == predicted_class_index(&target)
             {
@@ -278,19 +291,20 @@ fn train(
         // Stop training if our history shows we're not improving.
         if history.should_stop(opt.patience) {
             eprintln!("Training stopped early due to lack of improvement.");
-            let (best_epoch, stats, _network) = history.best_epoch()?;
-            eprintln!(
-                "Best epoch: {}: train loss = {:.4} ({:.2}%), test loss = {:.4} ({:.2}%)",
-                best_epoch,
-                stats.train_loss,
-                100.0 * stats.train_accuracy,
-                stats.test_loss,
-                100.0 * stats.test_accuracy,
-            );
-
             break;
         }
     }
+
+    // Report the best epoch and its stats.
+    let (best_epoch, stats, _network) = history.best_epoch()?;
+    eprintln!(
+        "Best epoch: {}: train loss = {:.4} ({:.2}%), test loss = {:.4} ({:.2}%)",
+        best_epoch,
+        stats.train_loss,
+        100.0 * stats.train_accuracy,
+        stats.test_loss,
+        100.0 * stats.test_accuracy,
+    );
 
     // Optionally plot the training and test loss.
     if let Some(plot_path) = opt.plot {

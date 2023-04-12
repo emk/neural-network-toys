@@ -1,7 +1,11 @@
 use std::fmt::Debug;
 
 use ndarray::{s, Array1, Array2, ArrayView1};
-use ndarray_rand::{rand::seq::SliceRandom, rand_distr::Uniform, RandomExt};
+use ndarray_rand::{
+    rand::seq::SliceRandom,
+    rand_distr::{Normal, Uniform},
+    RandomExt,
+};
 
 /// [Xavier][] initialization is a good default for initializing weights in a
 /// layer, with the [exception][] of layers using ReLU or SELU activations.
@@ -11,6 +15,18 @@ use ndarray_rand::{rand::seq::SliceRandom, rand_distr::Uniform, RandomExt};
 fn xavier(input_size: usize, output_size: usize) -> Array2<f32> {
     let weights = Array2::random((input_size, output_size), Uniform::new(-1.0, 1.0));
     weights / (input_size as f32).sqrt()
+}
+
+/// [He][] initialization is a good default for initializing weights in a layer
+/// with ReLU or SELU activations.
+///
+/// [He]: https://arxiv.org/abs/1502.01852
+fn he(input_size: usize, output_size: usize) -> Array2<f32> {
+    Array2::random(
+        (input_size, output_size),
+        Normal::new(0.0, (2.0 / input_size as f32).sqrt())
+            .expect("invalid normal distribution"),
+    )
 }
 
 /// Gradient associated with a fully-connected layer.
@@ -31,6 +47,13 @@ impl FullyConnected {
     /// Contruct using random Xavier weights.
     fn xavier(input_size: usize, output_size: usize) -> Self {
         let weights = xavier(input_size, output_size);
+        let biases = Array1::zeros(output_size);
+        Self { weights, biases }
+    }
+
+    /// Contruct using random He weights.
+    fn he(input_size: usize, output_size: usize) -> Self {
+        let weights = he(input_size, output_size);
         let biases = Array1::zeros(output_size);
         Self { weights, biases }
     }
@@ -194,6 +217,9 @@ impl LayerStatic for TanhLayer {
         input: &ArrayView1<f32>,
         dloss_doutput: &ArrayView1<f32>,
     ) -> Self::Gradient {
+        // TODO: Store `fully_connected.forward(input)` in `forward` so we don't
+        // have to compute it again.
+
         // ∂loss/∂preactivation = ∂loss/∂output * ∂output/∂preactivation
         //                      = dloss_doutput * (1 - tanh^2(output))
         let preactivation = self.fully_connected.forward(input);
@@ -207,6 +233,94 @@ impl LayerStatic for TanhLayer {
 }
 
 impl LayerWeightsAndBiases for TanhLayer {
+    fn weights(&self) -> &Array2<f32> {
+        &self.fully_connected.weights
+    }
+
+    fn biases(&self) -> &Array1<f32> {
+        &self.fully_connected.biases
+    }
+
+    fn weights_mut(&mut self) -> &mut Array2<f32> {
+        &mut self.fully_connected.weights
+    }
+
+    fn biases_mut(&mut self) -> &mut Array1<f32> {
+        &mut self.fully_connected.biases
+    }
+}
+
+/// A layer using the ReLU activation function, which is simple to compute
+/// and used in many state of the art neural networks.
+#[derive(Debug, Clone)]
+pub struct LeakyReluLayer {
+    fully_connected: FullyConnected,
+    /// The slope of the leaky ReLU function at negative values.
+    leak: f32,
+}
+
+impl LeakyReluLayer {
+    /// Initialize `ReluLayer` using random weights.
+    pub fn new(input_size: usize, output_size: usize, leak: f32) -> Self {
+        let fully_connected = FullyConnected::he(input_size, output_size);
+        Self {
+            fully_connected,
+            leak,
+        }
+    }
+}
+
+impl Layer for LeakyReluLayer {
+    fn boxed_clone(&self) -> Box<dyn Layer> {
+        Box::new(self.clone())
+    }
+
+    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
+        self.fully_connected.forward(input).mapv(|x| {
+            if x > 0.0 {
+                x
+            } else {
+                x * self.leak
+            }
+        })
+    }
+
+    fn update(
+        &mut self,
+        input: &ArrayView1<f32>,
+        dloss_doutput: &ArrayView1<f32>,
+        learning_rate: f32,
+    ) -> Array1<f32> {
+        let gradient = self.gradient(input, dloss_doutput);
+        self.fully_connected.update(&gradient, learning_rate);
+        gradient.dloss_dinput
+    }
+}
+
+impl LayerStatic for LeakyReluLayer {
+    type Gradient = FullyConnectedGradient;
+
+    fn gradient(
+        &self,
+        input: &ArrayView1<f32>,
+        dloss_doutput: &ArrayView1<f32>,
+    ) -> Self::Gradient {
+        // TODO: Store `fully_connected.forward(input)` in `forward` so we don't
+        // have to compute it again.
+
+        // ∂loss/∂preactivation = ∂loss/∂output * ∂output/∂preactivation
+        //                      = dloss_doutput * (1 if preactivation > 0 else 0)
+        let preactivation = self.fully_connected.forward(input);
+        let dloss_dpreativation = dloss_doutput
+            * (preactivation.mapv(|x| if x > 0.0 { 1.0 } else { self.leak }));
+
+        // Now we can compute our gradient.
+        self.fully_connected
+            .gradient(input, &dloss_dpreativation.view())
+    }
+}
+
+impl LayerWeightsAndBiases for LeakyReluLayer {
     fn weights(&self) -> &Array2<f32> {
         &self.fully_connected.weights
     }
@@ -621,9 +735,10 @@ mod tests {
         // and then numerically estimate the gradient and compare the two. If
         // more than 1% of the gradients are off, we will fail the test.
         let iterations = 100;
-        let delta = 1e-6;
-        let input_size = 3;
-        let output_size = 2;
+        let perturbation = 1e-6;
+        let epsilon = 1e-5;
+        let input_size = 10;
+        let output_size = 10;
 
         let mut tested = 0;
         let mut failures = 0;
@@ -645,15 +760,15 @@ mod tests {
             for i in 0..input.len() {
                 for j in 0..output.len() {
                     let mut new_layer = layer.clone();
-                    new_layer.weights_mut()[[i, j]] += delta;
+                    new_layer.weights_mut()[[i, j]] += perturbation;
                     let new_output = new_layer.forward(&input.view());
                     let new_loss = new_layer.loss(&new_output.view(), &target.view());
 
                     tested += 1;
                     if !relative_eq!(
                         new_loss,
-                        loss + delta * gradient.dloss_dweights[[i, j]],
-                        epsilon = 1e-6,
+                        loss + perturbation * gradient.dloss_dweights[[i, j]],
+                        epsilon = epsilon,
                     ) {
                         warn!(
                             "Updating weight from {} to {} updated loss from {} to {}",
@@ -673,15 +788,15 @@ mod tests {
             // element perturbed by a small amount.
             for j in 0..output.len() {
                 let mut new_layer = layer.clone();
-                new_layer.biases_mut()[j] += delta;
+                new_layer.biases_mut()[j] += perturbation;
                 let new_output = new_layer.forward(&input.view());
                 let new_loss = new_layer.loss(&new_output.view(), &target.view());
 
                 tested += 1;
                 if !relative_eq!(
                     new_loss,
-                    loss + delta * gradient.dloss_dbiases[j],
-                    epsilon = 1e-6,
+                    loss + perturbation * gradient.dloss_dbiases[j],
+                    epsilon = epsilon,
                 ) {
                     warn!(
                         "Updating bias from {} to {} updated loss from {} to {}",
@@ -700,15 +815,15 @@ mod tests {
             // element perturbed by a small amount.
             for i in 0..input.len() {
                 let mut new_input = input.clone();
-                new_input[i] += delta;
+                new_input[i] += perturbation;
                 let new_output = layer.forward(&new_input.view());
                 let new_loss = layer.loss(&new_output.view(), &target.view());
 
                 tested += 1;
                 if !relative_eq!(
                     new_loss,
-                    loss + delta * gradient.dloss_dinput[i],
-                    epsilon = 1e-6,
+                    loss + perturbation * gradient.dloss_dinput[i],
+                    epsilon = epsilon,
                 ) {
                     warn!(
                         "Updating input from {} to {} updated loss from {} to {}",
@@ -719,7 +834,7 @@ mod tests {
             }
 
             // Check our total number of failures.
-            if failures > tested / 100 {
+            if failures as f32 > tested as f32 * 0.01 {
                 panic!("Too many failures: {}/{}", failures, tested);
             }
         }
@@ -729,6 +844,13 @@ mod tests {
     fn test_tanh_layer_gradient_numerically() {
         test_layer_gradient_numerically(|input_size, output_size| {
             TanhLayer::new(input_size, output_size)
+        });
+    }
+
+    #[test]
+    fn test_relu_layer_gradient_numerically() {
+        test_layer_gradient_numerically(|input_size, output_size| {
+            LeakyReluLayer::new(input_size, output_size, 0.01)
         });
     }
 
