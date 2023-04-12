@@ -18,19 +18,24 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use csv;
 use log::debug;
-use ndarray::Array1;
-use plotters::{prelude::{ChartBuilder, IntoDrawingArea, PathElement}, style::{WHITE, IntoFont, RED, BLUE, BLACK, Color}, series::LineSeries};
+use mnist::MnistBuilder;
+use ndarray::{Array1, Array2, ArrayView1};
+use plotters::{
+    prelude::{ChartBuilder, IntoDrawingArea, PathElement},
+    series::LineSeries,
+    style::{Color, IntoFont, BLACK, BLUE, RED, WHITE},
+};
 use plotters_svg::SVGBackend;
 use rand::seq::SliceRandom;
 
+mod history;
 mod layers;
 
+use crate::history::{EpochStats, TrainingHistory};
 use crate::layers::{DropoutLayer, Network, SoftmaxLayer, TanhLayer};
 
 #[derive(Debug, Parser)]
-#[structopt(
-    about = "Neural network experiments"
-)]
+#[structopt(about = "Neural network experiments")]
 struct Opt {
     #[command(subcommand)]
     cmd: Command,
@@ -38,8 +43,11 @@ struct Opt {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Train a neural network.
-    Train(TrainOpt),
+    /// Train a neural network on the iris dataset.
+    Iris(IrisOpt),
+
+    /// Train a neural network on the MNIST dataset.
+    Mnist(MnistOpt),
 }
 
 #[derive(Debug, Parser)]
@@ -49,115 +57,253 @@ struct TrainOpt {
     #[arg(long = "epochs", default_value = "2000")]
     epochs: usize,
 
-    /// Training/test split.
-    #[arg(long = "split", default_value = "0.8")]
-    split: f64,
-
     /// Learning rate.
     #[arg(long = "learning-rate", default_value = "0.01")]
-    learning_rate: f64,
+    learning_rate: f32,
 
+    /// What fraction of our hidden layers should be dropped out while training?
+    /// This is a good way to reduce overfitting.
     #[arg(long = "dropout", default_value = "0.5")]
-    dropout: f64,
+    dropout: f32,
 
-    /// Input layer size.
-    #[arg(long = "input-size", default_value = "4")]
-    input_size: usize,
-
-    /// Hidden layer size. This needs to be adjusted if you change the dropout.
-    #[arg(long = "hidden-size", default_value = "14")]
-    hidden_size: usize,
-
-    /// Output layer size.
-    #[arg(long = "output-size", default_value = "3")]
-    output_size: usize,
+    /// How long should we wait before stopping training? If we see this many
+    /// models in a row that are worse than our best model, we'll stop.
+    #[arg(long = "patience", default_value = "5")]
+    patience: usize,
 
     /// Path to save plot of training and test loss.
     #[arg(long = "plot")]
     plot: Option<PathBuf>,
-
-    /// Path to the data file.
-    data: PathBuf,
-
-    /// Path to the output model file.
-    model: PathBuf,
 }
 
+#[derive(Debug, Parser)]
+struct IrisOpt {
+    /// Our training options.
+    #[structopt(flatten)]
+    train: TrainOpt,
+
+    /// Training/test split.
+    #[arg(long = "split", default_value = "0.8")]
+    split: f32,
+
+    /// Hidden layer size. This needs to be adjusted if you change the dropout.
+    #[arg(long = "hidden-layer-width", default_value = "14")]
+    hidden_layer_width: usize,
+}
+
+#[derive(Debug, Parser)]
+struct MnistOpt {
+    /// Our training options.
+    #[structopt(flatten)]
+    train: TrainOpt,
+
+    /// Hidden layer size. This needs to be adjusted if you change the dropout.
+    #[arg(long = "hidden-layer-width", default_value = "128")]
+    hidden_layer_width: usize,
+
+    /// Hidden layer count.
+    #[arg(long = "hidden-layers", default_value = "2")]
+    hidden_layers: usize,
+}
+
+/// Our main entry point.
 fn main() -> Result<()> {
     env_logger::init();
     let opt = Opt::parse();
 
     match opt.cmd {
-        Command::Train(opt) => train(opt)?,
+        Command::Iris(opt) => train_iris(opt)?,
+        Command::Mnist(opt) => train_mnist(opt)?,
     }
     Ok(())
 }
 
-/// First attempt at a training function, written largely by Copilot.
-fn train(opt: TrainOpt) -> Result<()> {
-    let data = read_data(&opt.data)?;
-    let (mut train, test) = split_data(&data, opt.split);
+/// Read the iris data from a CSV file and train a neural network on it.
+fn train_iris(opt: IrisOpt) -> Result<()> {
+    let feature_count = 4;
+    let class_count = 3;
+
+    let (inputs, targets) = read_csv_data(Path::new("data/iris.csv"), feature_count)?;
+    let train_and_test_data = split_data(inputs, targets, opt.split);
     eprintln!(
         "Training data: {} examples, test data: {} examples",
-        train.len(),
-        test.len()
+        train_and_test_data.train_inputs.nrows(),
+        train_and_test_data.test_inputs.nrows()
     );
 
-    let mut network = Network::new(TanhLayer::new(opt.input_size, opt.hidden_size));
-    network.add_layer(DropoutLayer::new(opt.hidden_size, 1.0-opt.dropout));
-    network.add_layer(SoftmaxLayer::new(opt.hidden_size, opt.output_size));
+    let mut network =
+        Network::new(TanhLayer::new(feature_count, opt.hidden_layer_width));
+    network.add_layer(DropoutLayer::new(
+        opt.hidden_layer_width,
+        1.0 - opt.train.dropout,
+    ));
+    network.add_layer(SoftmaxLayer::new(opt.hidden_layer_width, class_count));
 
-    let mut epoch_training_losses = Vec::new();
-    let mut epoch_test_losses = Vec::new();
+    train(opt.train, &mut network, &train_and_test_data)
+}
 
+/// Read the MNIST data from a file using the `minist` crate and train a neural
+/// network on it.
+fn train_mnist(opt: MnistOpt) -> Result<()> {
+    let mnist = MnistBuilder::new()
+        // If you omit the trailing "/" here, the downloader breaks.
+        .base_path("data/mnist/")
+        .label_format_one_hot()
+        .training_set_length(50000)
+        .validation_set_length(10000)
+        .test_set_length(10000)
+        .download_and_extract()
+        .finalize();
+
+    // Convert a giant array of u8s into a 2D array of f32s, each with dimension
+    // `[examples, features]`.
+    let array2_f32_from_vec_u8 = |v: Vec<u8>, cols: usize| {
+        let v = v.iter().map(|&x| x as f32).collect::<Vec<_>>();
+        let rows = v.len() / cols;
+        assert!(rows * cols == v.len());
+        Array2::from_shape_vec((rows, cols), v).expect("invalid shape")
+    };
+
+    // Convert the MNIST data into normalized `[examples, features]` arrays.
+    let img_size = 28 * 28;
+    let num_digits = 10;
+    let train_and_test_data = TrainAndTestData {
+        train_inputs: array2_f32_from_vec_u8(mnist.trn_img, img_size) / 255.0,
+        train_targets: array2_f32_from_vec_u8(mnist.trn_lbl, num_digits),
+        test_inputs: array2_f32_from_vec_u8(mnist.tst_img, img_size) / 255.0,
+        test_targets: array2_f32_from_vec_u8(mnist.tst_lbl, num_digits),
+    };
+
+    let mut network = Network::new(TanhLayer::new(img_size, opt.hidden_layer_width));
+    for _ in 1..opt.hidden_layers {
+        network.add_layer(TanhLayer::new(
+            opt.hidden_layer_width,
+            opt.hidden_layer_width,
+        ));
+        network.add_layer(DropoutLayer::new(
+            opt.hidden_layer_width,
+            1.0f32 - opt.train.dropout,
+        ));
+    }
+    network.add_layer(SoftmaxLayer::new(opt.hidden_layer_width, num_digits));
+
+    train(opt.train, &mut network, &train_and_test_data)
+}
+
+/// The data we'll be using for training and testing.
+///
+/// All of the data arrays are stored as `[examples, features]` arrays.
+struct TrainAndTestData {
+    train_inputs: Array2<f32>,
+    train_targets: Array2<f32>,
+    test_inputs: Array2<f32>,
+    test_targets: Array2<f32>,
+}
+
+/// First attempt at a training function, originally written largely by Copilot
+/// but revised heavily since.
+fn train(
+    opt: TrainOpt,
+    network: &mut Network,
+    training_data: &TrainAndTestData,
+) -> Result<()> {
+    let mut history = TrainingHistory::new();
     let mut rng = rand::thread_rng();
     for epoch in 0..opt.epochs {
         debug!("Model: {:#?}", network);
         let mut train_loss = 0.0;
         let mut train_correct = 0;
 
-        train.shuffle(&mut rng);
-        for (input, target) in &train {
-            network.update(input, target, opt.learning_rate);
-            let output = network.forward(input);
-            let loss = network.loss(&output, target);
+        // Shuffle our indices so we can train on the data in a random order.
+        let train_count = training_data.train_inputs.nrows();
+        let mut shuffled_indices = (0..train_count).collect::<Vec<_>>();
+        shuffled_indices.shuffle(&mut rng);
+
+        // Train on each example.
+        for i in shuffled_indices {
+            let input = training_data.train_inputs.row(i);
+            let target = training_data.train_targets.row(i);
+
+            network.update(&input, &target, opt.learning_rate);
+            let output = network.forward(&input);
+            let loss = network.loss(&output.view(), &target);
             assert!(loss.is_finite(), "loss is not finite: {}", loss);
             train_loss += loss;
-            if predicted_class_index(&output) == predicted_class_index(target) {
+            if predicted_class_index(&output.view()) == predicted_class_index(&target)
+            {
                 train_correct += 1;
             }
         }
-        train_loss /= train.len() as f64;
+        train_loss /= train_count as f32;
 
         let mut test_loss = 0.0;
         let mut test_correct = 0;
-        for (input, target) in &test {
-            let output = network.forward(input);
-            let loss = network.loss(&output, target);
+        let test_count = training_data.test_inputs.nrows();
+        for i in 0..test_count {
+            let input = training_data.test_inputs.row(i);
+            let target = training_data.test_targets.row(i);
+
+            let output = network.forward(&input);
+            let loss = network.loss(&output.view(), &target);
             test_loss += loss;
-            if predicted_class_index(&output) == predicted_class_index(target) {
+            if predicted_class_index(&output.view()) == predicted_class_index(&target)
+            {
                 test_correct += 1;
             }
         }
-        test_loss /= test.len() as f64;
+        test_loss /= test_count as f32;
 
-        epoch_training_losses.push(train_loss);
-        epoch_test_losses.push(test_loss);
+        let train_accuracy = train_correct as f32 / train_count as f32;
+        let test_accuracy = test_correct as f32 / test_count as f32;
+        history.add_epoch(
+            EpochStats {
+                train_loss,
+                train_accuracy,
+                test_loss,
+                test_accuracy,
+            },
+            &network,
+        );
 
+        // Report loss & accuracy as a percentage.
         eprintln!(
-            "Epoch {}: train loss = {:.4} ({}/{}), test loss = {:.4} ({} / {})",
+            "Epoch {}: train loss = {:.4} ({:.2}%), test loss = {:.4} ({:.2}%)",
             epoch,
             train_loss,
-            train_correct,
-            train.len(),
+            100.0 * train_accuracy,
             test_loss,
-            test_correct,
-            test.len(),
+            100.0 * test_accuracy,
         );
+
+        // Stop training if our history shows we're not improving.
+        if history.should_stop(opt.patience) {
+            eprintln!("Training stopped early due to lack of improvement.");
+            let (best_epoch, stats, _network) = history.best_epoch()?;
+            eprintln!(
+                "Best epoch: {}: train loss = {:.4} ({:.2}%), test loss = {:.4} ({:.2}%)",
+                best_epoch,
+                stats.train_loss,
+                100.0 * stats.train_accuracy,
+                stats.test_loss,
+                100.0 * stats.test_accuracy,
+            );
+
+            break;
+        }
     }
 
     // Optionally plot the training and test loss.
     if let Some(plot_path) = opt.plot {
+        let epoch_training_losses = history
+            .epochs()
+            .iter()
+            .map(|e| e.train_loss)
+            .collect::<Vec<_>>();
+        let epoch_test_losses = history
+            .epochs()
+            .iter()
+            .map(|e| e.test_loss)
+            .collect::<Vec<_>>();
         plot_loss(&plot_path, &epoch_training_losses, &epoch_test_losses)?;
     }
 
@@ -168,7 +314,7 @@ fn train(opt: TrainOpt) -> Result<()> {
 
 /// Read our training and test data from a CSV file.
 ///
-/// The file is in the format:
+/// The file is in a format similar to the Iris dataset:
 ///
 /// ```csv
 /// sepal_length,sepal_width,petal_length,petal_width,iris_virginica,iris_versicolor,iris_setosa
@@ -176,54 +322,104 @@ fn train(opt: TrainOpt) -> Result<()> {
 /// 4.9,3.0,1.4,0.2,0,0,1
 /// ```
 ///
-/// ...where the first four columns are the input data, and the last three are
-/// the target data.
-fn read_data(path: &Path) -> Result<Vec<(Array1<f64>, Array1<f64>)>> {
+/// ...where the first `input_cols` columns are the input data, and the
+/// remainder are the target data in one-hot format.
+///
+/// We return our data as `(inputs, targets)`, where the arrays have shape
+/// `[examples, features]`.
+fn read_csv_data(
+    path: &Path,
+    input_cols: usize,
+) -> Result<(Array2<f32>, Array2<f32>)> {
     let mut rdr = csv::Reader::from_path(path)?;
-    let mut data = Vec::new();
+    let mut inputs = Vec::new();
+    let mut targets = Vec::new();
     for result in rdr.records() {
         let record = result?;
-        let input = Array1::from(
+        inputs.push(
             record
                 .iter()
-                .take(4)
-                .map(|s| s.parse::<f64>().unwrap())
-                .collect::<Vec<_>>(),
+                .take(input_cols)
+                .map(|s| s.parse::<f32>())
+                .collect::<Result<Vec<_>, _>>()?,
         );
-        let target = Array1::from(
+        targets.push(
             record
                 .iter()
-                .skip(4)
-                .map(|s| s.parse::<f64>().unwrap())
-                .collect::<Vec<_>>(),
+                .skip(input_cols)
+                .map(|s| s.parse::<f32>())
+                .collect::<Result<Vec<_>, _>>()?,
         );
-        data.push((input, target));
     }
-    Ok(data)
+    Ok((
+        Array2::from_shape_vec(
+            (inputs.len(), input_cols),
+            inputs.into_iter().flatten().collect(),
+        )?,
+        Array2::from_shape_vec(
+            (targets.len(), targets[0].len()),
+            targets.into_iter().flatten().collect(),
+        )?,
+    ))
 }
 
-/// Split the data into training and test sets.
+/// Split the data into training and test sets. The parameters have the shape
+/// `[examples, features]`.
 fn split_data(
-    data: &[(Array1<f64>, Array1<f64>)],
-    split: f64,
-) -> (
-    Vec<(Array1<f64>, Array1<f64>)>,
-    Vec<(Array1<f64>, Array1<f64>)>,
-) {
-    // Shuffle first.
-    let mut data = data.to_vec();
-    let mut rng = rand::thread_rng();
-    data.shuffle(&mut rng);
+    inputs: Array2<f32>,
+    targets: Array2<f32>,
+    split: f32,
+) -> TrainAndTestData {
+    // To shuffle, we need to convert `inputs` and `targets` to
+    // `Vec<(Array1<f32>, Array1<f32>)>`, shuffle in place, split it, then convert back to
+    // a pair of `Array2<f32>` values.
 
-    // Then split.
-    let split_index = (data.len() as f64 * split) as usize;
-    let train = data[..split_index].to_vec();
-    let test = data[split_index..].to_vec();
-    (train, test)
+    // First we convert to a `Vec<(Array1<f32>, Array1<f32>)>`.
+    let mut data = inputs
+        .outer_iter()
+        .zip(targets.outer_iter())
+        .map(|(input, target)| (input.to_owned(), target.to_owned()))
+        .collect::<Vec<_>>();
+
+    // Then we shuffle in place.
+    data.shuffle(&mut rand::thread_rng());
+
+    // Convert our `Vec<(Array1<f32>, Array1<f32>)>` back to a pair of `Vec<Array1<f32>>` values.
+    let inputs = data
+        .iter()
+        .cloned()
+        .map(|(input, _)| input)
+        .collect::<Vec<_>>();
+    let targets = data
+        .into_iter()
+        .map(|(_, target)| target)
+        .collect::<Vec<_>>();
+
+    // Then we split and convert back to `Array2<f32>` using a helper function.
+    let split_index = (inputs.len() as f32 * split) as usize;
+    let array2_from_slice_array1 = |data: &[Array1<f32>]| -> Array2<f32> {
+        Array2::from_shape_vec(
+            (data.len(), data[0].len()),
+            data.into_iter().cloned().flatten().collect(),
+        )
+        .expect("invalid shape")
+    };
+    let train_inputs = array2_from_slice_array1(&inputs[..split_index]);
+    let train_targets = array2_from_slice_array1(&targets[..split_index]);
+    let test_inputs = array2_from_slice_array1(&inputs[split_index..]);
+    let test_targets = array2_from_slice_array1(&targets[split_index..]);
+
+    // Finally, we split and pack into a `TrainAndTestData` struct.
+    TrainAndTestData {
+        train_inputs,
+        train_targets,
+        test_inputs,
+        test_targets,
+    }
 }
 
 /// Convert a 1-hot encoded array to a class index.
-fn predicted_class_index(output: &Array1<f64>) -> usize {
+fn predicted_class_index(output: &ArrayView1<f32>) -> usize {
     output
         .iter()
         .enumerate()
@@ -234,11 +430,7 @@ fn predicted_class_index(output: &Array1<f64>) -> usize {
 
 /// Use `plotters` to plot the training and test losses for each epoch as an
 /// SVG and save it to `path`. Almost entirely written by Copilot.
-fn plot_loss(
-    path: &Path,
-    training_losses: &[f64],
-    test_losses: &[f64],
-) -> Result<()> {
+fn plot_loss(path: &Path, training_losses: &[f32], test_losses: &[f32]) -> Result<()> {
     let root = SVGBackend::new(path, (640, 480)).into_drawing_area();
     root.fill(&WHITE)?;
 
@@ -247,7 +439,7 @@ fn plot_loss(
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(40)
-        .build_cartesian_2d(0.0f64..training_losses.len() as f64, 0.0f64..1.0f64)?;
+        .build_cartesian_2d(0.0f32..training_losses.len() as f32, 0.0f32..1.0f32)?;
 
     chart
         .configure_mesh()
@@ -259,7 +451,10 @@ fn plot_loss(
 
     chart
         .draw_series(LineSeries::new(
-            training_losses.iter().enumerate().map(|(x, y)| (x as f64, *y)),
+            training_losses
+                .iter()
+                .enumerate()
+                .map(|(x, y)| (x as f32, *y)),
             &RED,
         ))?
         .label("Training")
@@ -267,7 +462,7 @@ fn plot_loss(
 
     chart
         .draw_series(LineSeries::new(
-            test_losses.iter().enumerate().map(|(x, y)| (x as f64, *y)),
+            test_losses.iter().enumerate().map(|(x, y)| (x as f32, *y)),
             &BLUE,
         ))?
         .label("Test")

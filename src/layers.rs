@@ -1,31 +1,30 @@
 use std::fmt::Debug;
 
-use ndarray::{Array1, Array2, s};
-use ndarray_rand::{rand_distr::Uniform, RandomExt, rand::seq::SliceRandom};
-
+use ndarray::{s, Array1, Array2, ArrayView1};
+use ndarray_rand::{rand::seq::SliceRandom, rand_distr::Uniform, RandomExt};
 
 /// [Xavier][] initialization is a good default for initializing weights in a
 /// layer, with the [exception][] of layers using ReLU or SELU activations.
 ///
 /// [Xavier]: http://proceedings.mlr.press/v9/glorot10a/glorot10a.pdf
 /// [exception]: https://stats.stackexchange.com/a/393012
-fn xavier(input_size: usize, output_size: usize) -> Array2<f64> {
+fn xavier(input_size: usize, output_size: usize) -> Array2<f32> {
     let weights = Array2::random((input_size, output_size), Uniform::new(-1.0, 1.0));
-    weights / (input_size as f64).sqrt()
+    weights / (input_size as f32).sqrt()
 }
 
 /// Gradient associated with a fully-connected layer.
 pub struct FullyConnectedGradient {
-    dloss_dbiases: Array1<f64>,
-    dloss_dweights: Array2<f64>,
-    dloss_dinput: Array1<f64>,
+    dloss_dbiases: Array1<f32>,
+    dloss_dweights: Array2<f32>,
+    dloss_dinput: Array1<f32>,
 }
 
 /// Fully-connected feed-forward layer without an activation function.
 #[derive(Debug, Clone)]
 struct FullyConnected {
-    weights: Array2<f64>,
-    biases: Array1<f64>,
+    weights: Array2<f32>,
+    biases: Array1<f32>,
 }
 
 impl FullyConnected {
@@ -37,15 +36,19 @@ impl FullyConnected {
     }
 
     /// Compute the output of this layer.
-    fn forward(&self, input: &Array1<f64>) -> Array1<f64> {
+    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
         input.dot(&self.weights) + &self.biases
     }
 
     /// Given  ∂loss/∂output, compute ∂loss/∂biases, ∂loss/∂weights, and ∂loss/∂input.
-    fn gradient(&self, input: &Array1<f64>, dloss_doutput: &Array1<f64>) -> FullyConnectedGradient {
+    fn gradient(
+        &self,
+        input: &ArrayView1<f32>,
+        dloss_doutput: &ArrayView1<f32>,
+    ) -> FullyConnectedGradient {
         // ∂loss/∂biases = ∂loss/∂output * ∂output/∂biases
         //               = dloss_doutput * 1
-        let dloss_dbiases = dloss_doutput.clone();
+        let dloss_dbiases = dloss_doutput.to_owned();
 
         // ∂loss/∂weights = ∂loss/∂output * ∂output/∂weights
         //                = ∂loss_doutput * input
@@ -64,9 +67,9 @@ impl FullyConnected {
         let dloss_dinput = dloss_doutput.dot(&self.weights.t());
 
         FullyConnectedGradient {
-            dloss_dbiases: dloss_dbiases,
-            dloss_dweights: dloss_dweights,
-            dloss_dinput: dloss_dinput,
+            dloss_dbiases,
+            dloss_dweights,
+            dloss_dinput,
         }
     }
 
@@ -74,7 +77,7 @@ impl FullyConnected {
     ///
     /// We subtract the gradient because we are minimizing the loss, and going
     /// "downhill" (which is why we call this "gradient descent")!
-    fn update(&mut self, gradient: &FullyConnectedGradient, learning_rate: f64) {
+    fn update(&mut self, gradient: &FullyConnectedGradient, learning_rate: f32) {
         self.biases = &self.biases - learning_rate * &gradient.dloss_dbiases;
         self.weights = &self.weights - learning_rate * &gradient.dloss_dweights;
     }
@@ -82,22 +85,29 @@ impl FullyConnected {
 
 /// A layer in our neural network.
 pub trait Layer: Debug + Send + Sync + 'static {
+    /// Return a boxed clone of this layer.
+    fn boxed_clone(&self) -> Box<dyn Layer>;
+
     /// Perform the foward pass through this layer, returning the output.
-    fn forward(&self, input: &Array1<f64>) -> Array1<f64>;
+    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32>;
 
     /// An appropriate loss function for this layer. By default, this is mean
     /// squared error, but it can be overridden for particular layers.
-    fn loss(&self, output: &Array1<f64>, target: &Array1<f64>) -> f64 {
+    fn loss(&self, output: &ArrayView1<f32>, target: &ArrayView1<f32>) -> f32 {
         // Mean squared error.
         let diff = output - target;
-        diff.dot(&diff) / output.len() as f64
+        diff.dot(&diff) / output.len() as f32
     }
 
     /// The derivative of the loss function with respect to the output.
-    fn dloss_doutput(&self, output: &Array1<f64>, target: &Array1<f64>) -> Array1<f64> {
+    fn dloss_doutput(
+        &self,
+        output: &ArrayView1<f32>,
+        target: &ArrayView1<f32>,
+    ) -> Array1<f32> {
         // loss          = 1/n * (output - target)^2
         // ∂loss/∂output = 2/n * (output - target)
-        (2.0 / output.len() as f64) * (output - target)
+        (2.0 / output.len() as f32) * (output - target)
     }
 
     /// Prepare this layer for a training step. This is normally a no-op, but
@@ -112,10 +122,10 @@ pub trait Layer: Debug + Send + Sync + 'static {
     /// Update the weights and biases of this layer, and return `dloss_dinput`.
     fn update(
         &mut self,
-        input: &Array1<f64>,
-        dloss_doutput: &Array1<f64>,
-        learning_rate: f64,
-    ) -> Array1<f64>;
+        input: &ArrayView1<f32>,
+        dloss_doutput: &ArrayView1<f32>,
+        learning_rate: f32,
+    ) -> Array1<f32>;
 }
 
 /// `Layer` methods that require knowing the gradient type, or that are
@@ -125,15 +135,19 @@ pub trait LayerStatic: Layer + Clone + Sized {
     type Gradient;
 
     /// Compute the gradient of this layer.
-    fn gradient(&self, input: &Array1<f64>, dloss_doutput: &Array1<f64>) -> Self::Gradient;
+    fn gradient(
+        &self,
+        input: &ArrayView1<f32>,
+        dloss_doutput: &ArrayView1<f32>,
+    ) -> Self::Gradient;
 }
 
 /// A layer that has weights and biases. Useful for things like numerical gradient checking.
 trait LayerWeightsAndBiases: LayerStatic {
-    fn weights(&self) -> &Array2<f64>;
-    fn biases(&self) -> &Array1<f64>;
-    fn weights_mut(&mut self) -> &mut Array2<f64>;
-    fn biases_mut(&mut self) -> &mut Array1<f64>;
+    fn weights(&self) -> &Array2<f32>;
+    fn biases(&self) -> &Array1<f32>;
+    fn weights_mut(&mut self) -> &mut Array2<f32>;
+    fn biases_mut(&mut self) -> &mut Array1<f32>;
 }
 
 /// A layer using the tanh activation function. This is a good default for
@@ -152,16 +166,20 @@ impl TanhLayer {
 }
 
 impl Layer for TanhLayer {
-    fn forward(&self, input: &Array1<f64>) -> Array1<f64> {
+    fn boxed_clone(&self) -> Box<dyn Layer> {
+        Box::new(self.clone())
+    }
+
+    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
         self.fully_connected.forward(input).mapv(|x| x.tanh())
     }
 
     fn update(
         &mut self,
-        input: &Array1<f64>,
-        dloss_doutput: &Array1<f64>,
-        learning_rate: f64,
-    ) -> Array1<f64> {
+        input: &ArrayView1<f32>,
+        dloss_doutput: &ArrayView1<f32>,
+        learning_rate: f32,
+    ) -> Array1<f32> {
         let gradient = self.gradient(input, dloss_doutput);
         self.fully_connected.update(&gradient, learning_rate);
         gradient.dloss_dinput
@@ -171,7 +189,11 @@ impl Layer for TanhLayer {
 impl LayerStatic for TanhLayer {
     type Gradient = FullyConnectedGradient;
 
-    fn gradient(&self, input: &Array1<f64>, dloss_doutput: &Array1<f64>) -> Self::Gradient {
+    fn gradient(
+        &self,
+        input: &ArrayView1<f32>,
+        dloss_doutput: &ArrayView1<f32>,
+    ) -> Self::Gradient {
         // ∂loss/∂preactivation = ∂loss/∂output * ∂output/∂preactivation
         //                      = dloss_doutput * (1 - tanh^2(output))
         let preactivation = self.fully_connected.forward(input);
@@ -179,24 +201,25 @@ impl LayerStatic for TanhLayer {
         let dloss_dpreativation = dloss_doutput * (1.0 - tanh_squared);
 
         // Now we can compute our gradient.
-        self.fully_connected.gradient(input, &dloss_dpreativation)
+        self.fully_connected
+            .gradient(input, &dloss_dpreativation.view())
     }
 }
 
 impl LayerWeightsAndBiases for TanhLayer {
-    fn weights(&self) -> &Array2<f64> {
+    fn weights(&self) -> &Array2<f32> {
         &self.fully_connected.weights
     }
 
-    fn biases(&self) -> &Array1<f64> {
+    fn biases(&self) -> &Array1<f32> {
         &self.fully_connected.biases
     }
 
-    fn weights_mut(&mut self) -> &mut Array2<f64> {
+    fn weights_mut(&mut self) -> &mut Array2<f32> {
         &mut self.fully_connected.weights
     }
 
-    fn biases_mut(&mut self) -> &mut Array1<f64> {
+    fn biases_mut(&mut self) -> &mut Array1<f32> {
         &mut self.fully_connected.biases
     }
 }
@@ -218,7 +241,11 @@ impl SoftmaxLayer {
 }
 
 impl Layer for SoftmaxLayer {
-    fn forward(&self, input: &Array1<f64>) -> Array1<f64> {
+    fn boxed_clone(&self) -> Box<dyn Layer> {
+        Box::new(self.clone())
+    }
+
+    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
         let output = self.fully_connected.forward(input);
 
         // Softmax is exp(x) / sum(exp(x)).
@@ -227,7 +254,7 @@ impl Layer for SoftmaxLayer {
         output / sum
     }
 
-    fn loss(&self, output: &Array1<f64>, target: &Array1<f64>) -> f64 {
+    fn loss(&self, output: &ArrayView1<f32>, target: &ArrayView1<f32>) -> f32 {
         // Categorical cross-entropy.
         let mut loss = 0.0;
         for (output, target) in output.iter().zip(target.iter()) {
@@ -236,7 +263,11 @@ impl Layer for SoftmaxLayer {
         loss
     }
 
-    fn dloss_doutput(&self, output: &Array1<f64>, target: &Array1<f64>) -> Array1<f64> {
+    fn dloss_doutput(
+        &self,
+        output: &ArrayView1<f32>,
+        target: &ArrayView1<f32>,
+    ) -> Array1<f32> {
         // See
         // https://towardsdatascience.com/derivative-of-the-softmax-function-and-the-categorical-cross-entropy-loss-ffceefc081d1
         output - target
@@ -244,10 +275,10 @@ impl Layer for SoftmaxLayer {
 
     fn update(
         &mut self,
-        input: &Array1<f64>,
-        dloss_doutput: &Array1<f64>,
-        learning_rate: f64,
-    ) -> Array1<f64> {
+        input: &ArrayView1<f32>,
+        dloss_doutput: &ArrayView1<f32>,
+        learning_rate: f32,
+    ) -> Array1<f32> {
         let gradient = self.gradient(input, dloss_doutput);
         self.fully_connected.update(&gradient, learning_rate);
         gradient.dloss_dinput
@@ -257,7 +288,11 @@ impl Layer for SoftmaxLayer {
 impl LayerStatic for SoftmaxLayer {
     type Gradient = FullyConnectedGradient;
 
-    fn gradient(&self, input: &Array1<f64>, dloss_doutput: &Array1<f64>) -> Self::Gradient {
+    fn gradient(
+        &self,
+        input: &ArrayView1<f32>,
+        dloss_doutput: &ArrayView1<f32>,
+    ) -> Self::Gradient {
         // This seems suspiciously convenient, but see
         // https://towardsdatascience.com/derivative-of-the-softmax-function-and-the-categorical-cross-entropy-loss-ffceefc081d1
         self.fully_connected.gradient(input, dloss_doutput)
@@ -265,19 +300,19 @@ impl LayerStatic for SoftmaxLayer {
 }
 
 impl LayerWeightsAndBiases for SoftmaxLayer {
-    fn weights(&self) -> &Array2<f64> {
+    fn weights(&self) -> &Array2<f32> {
         &self.fully_connected.weights
     }
 
-    fn biases(&self) -> &Array1<f64> {
+    fn biases(&self) -> &Array1<f32> {
         &self.fully_connected.biases
     }
 
-    fn weights_mut(&mut self) -> &mut Array2<f64> {
+    fn weights_mut(&mut self) -> &mut Array2<f32> {
         &mut self.fully_connected.weights
     }
 
-    fn biases_mut(&mut self) -> &mut Array1<f64> {
+    fn biases_mut(&mut self) -> &mut Array1<f32> {
         &mut self.fully_connected.biases
     }
 }
@@ -289,16 +324,16 @@ impl LayerWeightsAndBiases for SoftmaxLayer {
 #[derive(Debug, Clone)]
 pub struct DropoutLayer {
     /// The probability of keeping an input.
-    keep_probability: f64,
+    keep_probability: f32,
 
     /// The mask used to drop inputs. Kept neurons have a value of 1.0, and
     /// dropped neurons have a value of 0.0.
-    mask: Array1<f64>,
+    mask: Array1<f32>,
 }
 
 impl DropoutLayer {
     /// Create a new `DropoutLayer` with the given keep probability.
-    pub fn new(width: usize, keep_probability: f64) -> Self {
+    pub fn new(width: usize, keep_probability: f32) -> Self {
         Self {
             keep_probability,
             mask: Array1::ones(width),
@@ -307,7 +342,11 @@ impl DropoutLayer {
 }
 
 impl Layer for DropoutLayer {
-    fn forward(&self, input: &Array1<f64>) -> Array1<f64> {
+    fn boxed_clone(&self) -> Box<dyn Layer> {
+        Box::new(self.clone())
+    }
+
+    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
         input * &self.mask
     }
 
@@ -319,10 +358,14 @@ impl Layer for DropoutLayer {
 
         // We do this by setting exactly `keep_probability * width` values to 1.0,
         // and the rest to 0.0. Then we shuffle the array.
-        let keep_count = (self.keep_probability * self.mask.len() as f64).round() as usize;
+        let keep_count =
+            (self.keep_probability * self.mask.len() as f32).round() as usize;
         self.mask.slice_mut(s![0..keep_count]).fill(scaled);
         self.mask.slice_mut(s![keep_count..]).fill(0.0);
-        self.mask.as_slice_mut().unwrap().shuffle(&mut rand::thread_rng());
+        self.mask
+            .as_slice_mut()
+            .unwrap()
+            .shuffle(&mut rand::thread_rng());
     }
 
     /// Reset our mask after a training step, for testing and inference.
@@ -332,10 +375,10 @@ impl Layer for DropoutLayer {
 
     fn update(
         &mut self,
-        _input: &Array1<f64>,
-        dloss_doutput: &Array1<f64>,
-        _learning_rate: f64,
-    ) -> Array1<f64> {
+        _input: &ArrayView1<f32>,
+        dloss_doutput: &ArrayView1<f32>,
+        _learning_rate: f32,
+    ) -> Array1<f32> {
         // See https://deepnotes.io/dropout for a discussion of gradients and
         // dropout. Since we're scaling the output by the keep probability,
         // I guess we need to scale the gradient by the same amount?
@@ -374,44 +417,59 @@ impl Network {
     }
 
     /// Perform a forward pass through the network, returning the output.
-    pub fn forward(&self, input: &Array1<f64>) -> Array1<f64> {
-        let mut output = input.clone();
+    pub fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
+        let mut output = input.to_owned();
         for layer in &self.layers {
-            output = layer.forward(&output);
+            output = layer.forward(&output.view());
         }
         output
     }
 
     /// Compute the loss of the network's final layer.
-    pub fn loss(&self, output: &Array1<f64>, target: &Array1<f64>) -> f64 {
+    pub fn loss(&self, output: &ArrayView1<f32>, target: &ArrayView1<f32>) -> f32 {
         self.last_layer().loss(output, target)
     }
 
     /// Given an input and a target output, update the network's weights and
     /// biases, and return the loss.
-    pub fn update(&mut self, input: &Array1<f64>, target: &Array1<f64>, learning_rate: f64) {
+    pub fn update(
+        &mut self,
+        input: &ArrayView1<f32>,
+        target: &ArrayView1<f32>,
+        learning_rate: f32,
+    ) {
         // Start training on all layers.
         for layer in &mut self.layers {
             layer.start_training_step();
         }
 
         // Forward pass.
-        let mut output = input.clone();
-        let mut outputs = vec![output.clone()];
+        let mut outputs = vec![input.to_owned()];
         for layer in &self.layers {
-            output = layer.forward(&output);
-            outputs.push(output.clone());
+            let output = layer.forward(&outputs.last().unwrap().view());
+            outputs.push(output);
         }
+        let output = outputs.last().unwrap();
 
         // Backward pass.
-        let mut dloss_doutput = self.last_layer().dloss_doutput(&output, &target);
+        let mut dloss_doutput =
+            self.last_layer().dloss_doutput(&output.view(), &target);
         for (layer, output) in self.layers.iter_mut().zip(outputs.into_iter()).rev() {
-            dloss_doutput = layer.update(&output, &dloss_doutput, learning_rate);
+            dloss_doutput =
+                layer.update(&output.view(), &dloss_doutput.view(), learning_rate);
         }
 
         // End training on all layers.
         for layer in &mut self.layers {
             layer.end_training_step();
+        }
+    }
+}
+
+impl Clone for Network {
+    fn clone(&self) -> Self {
+        Self {
+            layers: self.layers.iter().map(|l| l.boxed_clone()).collect(),
         }
     }
 }
@@ -434,16 +492,16 @@ mod tests {
         };
 
         let input = array![1.0];
-        let output = layer.forward(&input);
+        let output = layer.forward(&input.view());
         assert_eq!(output, array![0.7615941559557649]);
 
         let target = array![0.0];
-        let dloss_doutput = layer.dloss_doutput(&output, &target);
+        let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
         // ∂loss/∂output = (2.0 / n) * (output - target)
         //               = (2.0 / 1) * (0.7615941559557649 - 0.0)
         assert_relative_eq!(dloss_doutput, array![1.52318831191], epsilon = 1e-10);
 
-        let dloss_dinput = layer.update(&input, &dloss_doutput, 0.1);
+        let dloss_dinput = layer.update(&input.view(), &dloss_doutput.view(), 0.1);
 
         // ∂loss/∂preactivation = ∂loss/∂output * ∂output/∂preactivation
         //                      = 1.52318831191 * (1 - tanh^2(output))
@@ -480,12 +538,12 @@ mod tests {
         };
 
         let input = array![1.0];
-        let output = layer.forward(&input);
+        let output = layer.forward(&input.view());
         assert_eq!(output, array![1.0]);
 
         let target = array![0.0];
-        let dloss_doutput = layer.dloss_doutput(&output, &target);
-        let dloss_dinput = layer.update(&input, &dloss_doutput, 0.1);
+        let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
+        let dloss_dinput = layer.update(&input.view(), &dloss_doutput.view(), 0.1);
         assert_eq!(dloss_dinput, array![1.0]);
         assert_eq!(layer.fully_connected.weights, array![[0.9]]);
         assert_eq!(layer.fully_connected.biases, array![-0.1]);
@@ -506,7 +564,7 @@ mod tests {
         //
         // e^23 / (e^23 + e^28) = 0.00669285092
         // e^28 / (e^23 + e^28) = 0.99330714907
-        let output = layer.forward(&input);
+        let output = layer.forward(&input.view());
         assert_relative_eq!(
             output,
             array![0.00669285092, 0.99330714907],
@@ -514,8 +572,8 @@ mod tests {
         );
 
         let target = array![1.0, 0.0];
-        let dloss_doutput = layer.dloss_doutput(&output, &target);
-        let dloss_dinput = layer.update(&input, &dloss_doutput, 0.1);
+        let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
+        let dloss_dinput = layer.update(&input.view(), &dloss_doutput.view(), 0.1);
 
         // biases -= (output - target) * leaning_rate
         // biases[0] = 1 - (0.00669285092 - 1) * 0.1 = 1.09933071491
@@ -574,11 +632,11 @@ mod tests {
             let input = Array::random(input_size, Uniform::new(-1.0, 1.0));
             let target = Array::random(output_size, Uniform::new(0.0, 1.0));
 
-            let output = layer.forward(&input);
-            let loss = layer.loss(&output, &target);
+            let output = layer.forward(&input.view());
+            let loss = layer.loss(&output.view(), &target.view());
 
-            let dloss_doutput = layer.dloss_doutput(&output, &target);
-            let gradient = layer.gradient(&input, &dloss_doutput);
+            let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
+            let gradient = layer.gradient(&input.view(), &dloss_doutput.view());
 
             // We will now numerically estimate the gradient of the loss
             // function with respect to the weights. We will do this by
@@ -588,8 +646,8 @@ mod tests {
                 for j in 0..output.len() {
                     let mut new_layer = layer.clone();
                     new_layer.weights_mut()[[i, j]] += delta;
-                    let new_output = new_layer.forward(&input);
-                    let new_loss = new_layer.loss(&new_output, &target);
+                    let new_output = new_layer.forward(&input.view());
+                    let new_loss = new_layer.loss(&new_output.view(), &target.view());
 
                     tested += 1;
                     if !relative_eq!(
@@ -616,8 +674,8 @@ mod tests {
             for j in 0..output.len() {
                 let mut new_layer = layer.clone();
                 new_layer.biases_mut()[j] += delta;
-                let new_output = new_layer.forward(&input);
-                let new_loss = new_layer.loss(&new_output, &target);
+                let new_output = new_layer.forward(&input.view());
+                let new_loss = new_layer.loss(&new_output.view(), &target.view());
 
                 tested += 1;
                 if !relative_eq!(
@@ -643,8 +701,8 @@ mod tests {
             for i in 0..input.len() {
                 let mut new_input = input.clone();
                 new_input[i] += delta;
-                let new_output = layer.forward(&new_input);
-                let new_loss = layer.loss(&new_output, &target);
+                let new_output = layer.forward(&new_input.view());
+                let new_loss = layer.loss(&new_output.view(), &target.view());
 
                 tested += 1;
                 if !relative_eq!(
