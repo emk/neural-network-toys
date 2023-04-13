@@ -12,14 +12,17 @@
 /// code actually works. I'm particularly happy about the numerical gradient
 /// checking, which is a great way to verify that the backpropagation code
 /// is vaguely trustworthy.
-use std::path::{Path, PathBuf};
+use std::{
+    cmp::min,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use csv;
-use log::debug;
+use log::{debug, trace};
 use mnist::MnistBuilder;
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{s, Array1, Array2, ArrayView1};
 use plotters::{
     prelude::{ChartBuilder, IntoDrawingArea, PathElement},
     series::LineSeries,
@@ -61,6 +64,10 @@ struct TrainOpt {
     #[arg(long = "epochs", default_value = "2000")]
     epochs: usize,
 
+    /// Batch size.
+    #[arg(long = "batch-size", default_value = "32")]
+    batch_size: usize,
+
     /// Learning rate.
     #[arg(long = "learning-rate", default_value = "0.01")]
     learning_rate: f32,
@@ -72,7 +79,7 @@ struct TrainOpt {
 
     /// Which activation function should we use? Does not apply to the output
     /// layer, which always uses softmax.
-    #[arg(long = "activation", default_value = "tanh", value_names = ["leaky_relu", "tanh"])]
+    #[arg(long = "activation", default_value = "tanh", value_parser = ["leaky_relu", "tanh"])]
     activation: String,
 
     /// Leaky ReLU alpha.
@@ -231,27 +238,45 @@ fn train(
         let mut train_loss = 0.0;
         let mut train_correct = 0;
 
+        // Compute how many batches we'll have.
+        let train_count = training_data.train_inputs.nrows();
+        let batch_count = (train_count + opt.batch_size - 1) / opt.batch_size;
+
         // Shuffle our indices so we can train on the data in a random order.
         let train_count = training_data.train_inputs.nrows();
-        let mut shuffled_indices = (0..train_count).collect::<Vec<_>>();
-        shuffled_indices.shuffle(&mut rng);
+        let mut shuffled_batch_indices = (0..batch_count).collect::<Vec<_>>();
+        shuffled_batch_indices.shuffle(&mut rng);
 
         // Train on each example.
-        for i in shuffled_indices {
-            let input = training_data.train_inputs.row(i);
-            let target = training_data.train_targets.row(i);
+        for i in shuffled_batch_indices {
+            trace!("Epoch {} batch {}/{}", epoch, i, batch_count);
 
-            network.update(&input, &target, opt.learning_rate);
-            let output = network.forward(&input);
-            let loss = network.loss(&output.view(), &target);
+            // Find the start and end of this batch.
+            let batch_start = i * opt.batch_size;
+            let batch_end = min(batch_start + opt.batch_size, train_count);
+            let inputs = training_data
+                .train_inputs
+                .slice(s![batch_start..batch_end, ..]);
+            let targets = training_data
+                .train_targets
+                .slice(s![batch_start..batch_end, ..]);
+
+            // Train on our batch.
+            network.update(&inputs, &targets, opt.learning_rate);
+
+            // Compute the loss for our batch.
+            let outputs = network.forward(&inputs);
+            let loss = network.loss(&outputs.view(), &targets).sum();
             if !loss.is_finite() {
                 eprintln!("Loss is not finite: {}", loss);
                 break 'epochs;
             }
             train_loss += loss;
-            if predicted_class_index(&output.view()) == predicted_class_index(&target)
-            {
-                train_correct += 1;
+
+            for (output, target) in outputs.outer_iter().zip(targets.outer_iter()) {
+                if predicted_class_index(&output) == predicted_class_index(&target) {
+                    train_correct += 1;
+                }
             }
         }
         train_loss /= train_count as f32;
@@ -260,15 +285,20 @@ fn train(
         let mut test_correct = 0;
         let test_count = training_data.test_inputs.nrows();
         for i in 0..test_count {
-            let input = training_data.test_inputs.row(i);
-            let target = training_data.test_targets.row(i);
+            let inputs = training_data.test_inputs.slice(s![i..i + 1, ..]);
+            let targets = training_data.test_targets.slice(s![i..i + 1, ..]);
 
-            let output = network.forward(&input);
-            let loss = network.loss(&output.view(), &target);
+            let outputs = network.forward(&inputs);
+            let loss = network
+                .loss(&outputs.view(), &targets)
+                .mean()
+                .expect("empty batch");
             test_loss += loss;
-            if predicted_class_index(&output.view()) == predicted_class_index(&target)
-            {
-                test_correct += 1;
+
+            for (output, target) in outputs.outer_iter().zip(targets.outer_iter()) {
+                if predicted_class_index(&output) == predicted_class_index(&target) {
+                    test_correct += 1;
+                }
             }
         }
         test_loss /= test_count as f32;

@@ -1,35 +1,67 @@
+// TASK: We are converting this file from Stochastic Gradient Descent to
+// mini-batch gradient descent. To do this, we need to take many APIs
+// that previously took an `Array1` or an `ArrayView1` and change them
+// to take an `ArrayView2` or an `Array2`.  Our arrays will be stored
+// `(examples, features)` instead of `(features,)`.
+//
+// We will work through the file from the top down, converting each API
+// as we go.
+
 use std::fmt::Debug;
 
-use ndarray::{s, Array1, Array2, ArrayView1};
+use ndarray::{s, Array1, Array2, ArrayView2, Axis};
 use ndarray_rand::rand::seq::SliceRandom;
 
 use crate::initialization::InitializationType;
 
+/// The axis along which we store examples in an `Array2`.
+///
+/// This is the out set of brackets in `[[1, 2, 3], [4, 5, 6]]`.
+const ARRAY2_EXAMPLES_AXIS: Axis = Axis(0);
+
+/// The axis along which we store features in an `Array2`.
+///
+/// This is the inner set of brackets in `[[1, 2, 3], [4, 5, 6]]`.
+const ARRAY2_FEATURES_AXIS: Axis = Axis(1);
+
 /// A layer in our neural network.
+///
+/// This is designed to support mini-batch gradient descent, so all
+/// functions take and return arrays with shape `(examples, features)`.
 pub trait Layer: Debug + Send + Sync + 'static {
     /// Return a boxed clone of this layer.
     fn boxed_clone(&self) -> Box<dyn Layer>;
 
     /// Perform the foward pass through this layer, returning the output.
-    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32>;
+    fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32>;
 
     /// An appropriate loss function for this layer. By default, this is mean
     /// squared error, but it can be overridden for particular layers.
-    fn loss(&self, output: &ArrayView1<f32>, target: &ArrayView1<f32>) -> f32 {
+    ///
+    /// Our return value is a vector of length `examples`, where each element
+    /// is the loss for that example.
+    fn loss(&self, output: &ArrayView2<f32>, target: &ArrayView2<f32>) -> Array1<f32> {
         // Mean squared error.
+        //
+        // For each output, we want to compute:
+        //
+        // loss = 1/n * (output - target)^2
         let diff = output - target;
-        diff.dot(&diff) / output.len() as f32
+
+        // We want to compute the mean of each row, so we need to sum each row.
+        diff.sum_axis(ARRAY2_FEATURES_AXIS)
+            / (output.len_of(ARRAY2_FEATURES_AXIS) as f32)
     }
 
     /// The derivative of the loss function with respect to the output.
     fn dloss_doutput(
         &self,
-        output: &ArrayView1<f32>,
-        target: &ArrayView1<f32>,
-    ) -> Array1<f32> {
+        output: &ArrayView2<f32>,
+        target: &ArrayView2<f32>,
+    ) -> Array2<f32> {
         // loss          = 1/n * (output - target)^2
         // ∂loss/∂output = 2/n * (output - target)
-        (2.0 / output.len() as f32) * (output - target)
+        (2.0 / output.len_of(ARRAY2_FEATURES_AXIS) as f32) * (output - target)
     }
 
     /// Prepare this layer for a training step. This is normally a no-op, but
@@ -48,9 +80,9 @@ pub trait Layer: Debug + Send + Sync + 'static {
     /// ∂loss/∂biases and ∂loss/∂weights (when applicable) and store them.
     fn backward(
         &mut self,
-        input: &ArrayView1<f32>,
-        dloss_doutput: &ArrayView1<f32>,
-    ) -> Array1<f32>;
+        input: &ArrayView2<f32>,
+        dloss_doutput: &ArrayView2<f32>,
+    ) -> Array2<f32>;
 
     /// Update the weights and biases of this layer, and return `dloss_dinput`.
     fn update(&mut self, _learning_rate: f32) {}
@@ -59,10 +91,24 @@ pub trait Layer: Debug + Send + Sync + 'static {
 /// Fully-connected feed-forward layer without an activation function.
 #[derive(Debug, Clone)]
 struct FullyConnectedLayer {
+    /// Weight matrix.
+    ///
+    /// Shape: (input_size, output_size)
     weights: Array2<f32>,
+
+    /// Biases for each neuron.
+    ///
+    /// Shape: (output_size,)
     biases: Array1<f32>,
 
+    /// ∂loss/∂biases averaged over the batch.
+    ///
+    /// Shape: (output_size,)
     dloss_dbiases: Array1<f32>,
+
+    /// ∂loss/∂weights averaged over the batch.
+    ///
+    /// Shape: (input_size, output_size).
     dloss_dweights: Array2<f32>,
 }
 
@@ -87,30 +133,53 @@ impl Layer for FullyConnectedLayer {
         Box::new(self.clone())
     }
 
-    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
+    fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
         input.dot(&self.weights) + &self.biases
     }
 
     fn backward(
         &mut self,
-        input: &ArrayView1<f32>,
-        dloss_doutput: &ArrayView1<f32>,
-    ) -> Array1<f32> {
+        input: &ArrayView2<f32>,
+        dloss_doutput: &ArrayView2<f32>,
+    ) -> Array2<f32> {
         // ∂loss/∂biases = ∂loss/∂output * ∂output/∂biases
         //               = dloss_doutput * 1
-        self.dloss_dbiases = dloss_doutput.to_owned();
+        self.dloss_dbiases = dloss_doutput
+            .mean_axis(ARRAY2_EXAMPLES_AXIS)
+            .expect("batch size > 0");
 
         // ∂loss/∂weights = ∂loss/∂output * ∂output/∂weights
         //                = ∂loss_doutput * input
         //
         // We need to do this manually, because the `outer` method is not
         // supported by ndarray.
-        self.dloss_dweights = Array2::zeros((input.len(), dloss_doutput.len()));
-        for (i, x) in input.iter().enumerate() {
-            for (j, y) in dloss_doutput.iter().enumerate() {
-                self.dloss_dweights[[i, j]] = x * y;
-            }
-        }
+        //
+        // Let's work through this using Einstein tensor notation. This notation
+        // has an implicit sum over repeated indices. For example:
+        //
+        //   a_{i,j} = b_{i,k} * c_{k,j}
+        //
+        // means that we sum over the repeated index `k`:
+        //
+        //   a_{i,j} = sum_{k} b_{i,k} * c_{k,j}
+        //
+        // We will use the following letters to represent our indices:
+        //
+        //   b: batch
+        //   i: input
+        //   o: output
+        //
+        // We will write indices in the order they appear in the array, so
+        // we have:
+        //
+        // input_{b,i}
+        // dloss_doutput_{b,o}
+        //
+        // And we want to compute:
+        //
+        // dloss_dweights_{i,o} = input_{b,i} * dloss_doutput_{b,o} / batch_size
+        self.dloss_dweights = input.t().dot(dloss_doutput)
+            / dloss_doutput.len_of(ARRAY2_EXAMPLES_AXIS) as f32;
 
         // ∂loss/∂input = ∂loss/∂output * ∂output/∂input
         //              = dloss_doutput * weights
@@ -140,15 +209,15 @@ impl Layer for TanhLayer {
         Box::new(self.clone())
     }
 
-    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
+    fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
         input.mapv(|x| x.tanh())
     }
 
     fn backward(
         &mut self,
-        input: &ArrayView1<f32>,
-        dloss_doutput: &ArrayView1<f32>,
-    ) -> Array1<f32> {
+        input: &ArrayView2<f32>,
+        dloss_doutput: &ArrayView2<f32>,
+    ) -> Array2<f32> {
         // ∂loss/∂input = ∂loss/∂output * ∂output/∂input
         //              = dloss_doutput * (1 - tanh^2(x))
         dloss_doutput * &(1.0 - input.mapv(|x| x.tanh().powi(2)))
@@ -175,18 +244,21 @@ impl Layer for LeakyReluLayer {
         Box::new(self.clone())
     }
 
-    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
+    fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
         input.mapv(|x| if x > 0.0 { x } else { x * self.leak })
     }
 
     fn backward(
         &mut self,
-        _input: &ArrayView1<f32>,
-        dloss_doutput: &ArrayView1<f32>,
-    ) -> Array1<f32> {
+        input: &ArrayView2<f32>,
+        dloss_doutput: &ArrayView2<f32>,
+    ) -> Array2<f32> {
         // ∂loss/∂input = ∂loss/∂output * ∂output/∂input
-        //              = dloss_doutput * (1 if x > 0 else leak)
-        dloss_doutput.mapv(|x| if x > 0.0 { x } else { x * self.leak })
+        //              = dloss_doutput * (1 if x >= 0 else leak)
+        //
+        // The derivative of the ReLU function is technically undefined at x=0,
+        // so we just use the derivative at x=0+ε.
+        dloss_doutput * &input.mapv(|x| if x >= 0.0 { 1.0 } else { self.leak })
     }
 }
 
@@ -208,37 +280,42 @@ impl Layer for SoftmaxLayer {
         Box::new(self.clone())
     }
 
-    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
-        // Softmax is exp(x) / sum(exp(x)).
-        let output = input.mapv(|x| x.exp());
-        let sum = output.sum();
-        output / sum
+    fn forward(&self, inputs: &ArrayView2<f32>) -> Array2<f32> {
+        // Softmax is exp(x) / sum(exp(x)) for each example in inputs.
+        let mut outputs = inputs.mapv(|x| x.exp());
+        let reciprocal_sums = outputs.sum_axis(ARRAY2_FEATURES_AXIS).mapv(|x| 1.0 / x);
+
+        // We need to calculate:
+        //
+        //  outputs_{b,o} = outputs_{b,o} * reciprocal_sums_{b}
+        for (mut output, reciprocal_sum) in
+            outputs.outer_iter_mut().zip(reciprocal_sums.iter())
+        {
+            output *= *reciprocal_sum;
+        }
+        outputs
     }
 
     fn backward(
         &mut self,
-        _input: &ArrayView1<f32>,
-        dloss_doutput: &ArrayView1<f32>,
-    ) -> Array1<f32> {
+        _input: &ArrayView2<f32>,
+        dloss_doutput: &ArrayView2<f32>,
+    ) -> Array2<f32> {
         // This seems suspiciously convenient, but see
         // https://towardsdatascience.com/derivative-of-the-softmax-function-and-the-categorical-cross-entropy-loss-ffceefc081d1
         dloss_doutput.to_owned()
     }
 
-    fn loss(&self, output: &ArrayView1<f32>, target: &ArrayView1<f32>) -> f32 {
+    fn loss(&self, output: &ArrayView2<f32>, target: &ArrayView2<f32>) -> Array1<f32> {
         // Categorical cross-entropy.
-        let mut loss = 0.0;
-        for (output, target) in output.iter().zip(target.iter()) {
-            loss -= target * output.ln();
-        }
-        loss
+        (target * output.mapv(|x| x.ln())).sum_axis(ARRAY2_FEATURES_AXIS) * -1.0
     }
 
     fn dloss_doutput(
         &self,
-        output: &ArrayView1<f32>,
-        target: &ArrayView1<f32>,
-    ) -> Array1<f32> {
+        output: &ArrayView2<f32>,
+        target: &ArrayView2<f32>,
+    ) -> Array2<f32> {
         // See
         // https://towardsdatascience.com/derivative-of-the-softmax-function-and-the-categorical-cross-entropy-loss-ffceefc081d1
         output - target
@@ -274,15 +351,15 @@ impl Layer for DropoutLayer {
         Box::new(self.clone())
     }
 
-    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
+    fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
         input * &self.mask
     }
 
     fn backward(
         &mut self,
-        _input: &ArrayView1<f32>,
-        dloss_doutput: &ArrayView1<f32>,
-    ) -> Array1<f32> {
+        _input: &ArrayView2<f32>,
+        dloss_doutput: &ArrayView2<f32>,
+    ) -> Array2<f32> {
         // See https://deepnotes.io/dropout for a discussion of gradients and
         // dropout. Since we're scaling the output by the keep probability,
         // I guess we need to scale the gradient by the same amount?
@@ -392,7 +469,7 @@ impl Network {
     }
 
     /// Perform a forward pass through the network, returning the output.
-    pub fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
+    pub fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
         let mut output = input.to_owned();
         for layer in &self.layers {
             output = layer.forward(&output.view());
@@ -401,7 +478,11 @@ impl Network {
     }
 
     /// Compute the loss of the network's final layer.
-    pub fn loss(&self, output: &ArrayView1<f32>, target: &ArrayView1<f32>) -> f32 {
+    pub fn loss(
+        &self,
+        output: &ArrayView2<f32>,
+        target: &ArrayView2<f32>,
+    ) -> Array1<f32> {
         self.last_layer().loss(output, target)
     }
 
@@ -409,8 +490,8 @@ impl Network {
     /// biases, and return the loss.
     pub fn update(
         &mut self,
-        input: &ArrayView1<f32>,
-        target: &ArrayView1<f32>,
+        input: &ArrayView2<f32>,
+        target: &ArrayView2<f32>,
         learning_rate: f32,
     ) {
         // Start training on all layers.
@@ -493,31 +574,35 @@ mod tests {
             Box::new(self.clone())
         }
 
-        fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
+        fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
             self.activation_layer
                 .forward(&self.fully_connected.forward(input).view())
         }
 
         fn backward(
             &mut self,
-            input: &ArrayView1<f32>,
-            dloss_doutput: &ArrayView1<f32>,
-        ) -> Array1<f32> {
+            input: &ArrayView2<f32>,
+            dloss_doutput: &ArrayView2<f32>,
+        ) -> Array2<f32> {
             self.fully_connected.backward(
                 input,
                 &self.activation_layer.backward(input, dloss_doutput).view(),
             )
         }
 
-        fn loss(&self, output: &ArrayView1<f32>, target: &ArrayView1<f32>) -> f32 {
+        fn loss(
+            &self,
+            output: &ArrayView2<f32>,
+            target: &ArrayView2<f32>,
+        ) -> Array1<f32> {
             self.activation_layer.loss(output, target)
         }
 
         fn dloss_doutput(
             &self,
-            output: &ArrayView1<f32>,
-            target: &ArrayView1<f32>,
-        ) -> Array1<f32> {
+            output: &ArrayView2<f32>,
+            target: &ArrayView2<f32>,
+        ) -> Array2<f32> {
             self.activation_layer.dloss_doutput(output, target)
         }
 
@@ -530,15 +615,15 @@ mod tests {
     fn test_tanh_layer_single_node() {
         let mut layer = FullyConnectedWithActivation::new_simple(TanhLayer::new());
 
-        let input = array![1.0];
+        let input = array![[1.0]];
         let output = layer.forward(&input.view());
-        assert_eq!(output, array![0.7615941559557649]);
+        assert_eq!(output, array![[0.7615941559557649]]);
 
-        let target = array![0.0];
+        let target = array![[0.0]];
         let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
         // ∂loss/∂output = (2.0 / n) * (output - target)
         //               = (2.0 / 1) * (0.7615941559557649 - 0.0)
-        assert_relative_eq!(dloss_doutput, array![1.52318831191], epsilon = 1e-10);
+        assert_relative_eq!(dloss_doutput, array![[1.52318831191]], epsilon = 1e-10);
 
         let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
         layer.update(0.1);
@@ -565,24 +650,36 @@ mod tests {
 
         // ∂loss/∂input = ∂loss/∂preactivation * ∂preactivation/∂input
         //              = (1.52318831191 * (1 - 0.7615941559557649^2)) * 1.0
-        assert_relative_eq!(dloss_dinput, array![0.63970000844], epsilon = 1e-10);
+        assert_relative_eq!(dloss_dinput, array![[0.63970000844]], epsilon = 1e-10);
     }
 
     #[test]
     fn test_softmax_layer_single_node() {
         let mut layer = FullyConnectedWithActivation::new_simple(SoftmaxLayer::new());
 
-        let input = array![1.0];
+        let input = array![[1.0]];
         let output = layer.forward(&input.view());
-        assert_eq!(output, array![1.0]);
+        assert_eq!(output, array![[1.0]]);
 
-        let target = array![0.0];
+        let target = array![[0.0]];
         let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
         let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
         layer.update(0.1);
-        assert_eq!(dloss_dinput, array![1.0]);
+        assert_eq!(dloss_dinput, array![[1.0]]);
         assert_eq!(layer.fully_connected.weights, array![[0.9]]);
         assert_eq!(layer.fully_connected.biases, array![-0.1]);
+    }
+
+    #[test]
+    fn test_leaky_relu_layer() {
+        let mut layer = LeakyReluLayer::new(0.01);
+        let input = array![[1.0, 0.0, -1.0], [2.0, 0.0, -2.0]];
+        let output = layer.forward(&input.view());
+        assert_eq!(output, array![[1.0, 0.0, -0.01], [2.0, 0.0, -0.02]]);
+
+        let dloss_doutput = array![[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]];
+        let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
+        assert_eq!(dloss_dinput, array![[1.0, 1.0, 0.01], [2.0, 2.0, 0.02]]);
     }
 
     #[test]
@@ -597,7 +694,7 @@ mod tests {
             SoftmaxLayer::new(),
         );
 
-        let input = array![1.0, 2.0, 3.0];
+        let input = array![[1.0, 2.0, 3.0]];
         // 1*1 + 2*3 + 3*5 + 1 = 23
         // 1*2 + 2*4 + 3*6 + 0 = 28
         //
@@ -606,11 +703,11 @@ mod tests {
         let output = layer.forward(&input.view());
         assert_relative_eq!(
             output,
-            array![0.00669285092, 0.99330714907],
-            epsilon = 1e-10
+            array![[0.00669285092, 0.99330714907]],
+            epsilon = 1e-6
         );
 
-        let target = array![1.0, 0.0];
+        let target = array![[1.0, 0.0]];
         let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
         let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
         layer.update(0.1);
@@ -621,7 +718,7 @@ mod tests {
         assert_relative_eq!(
             layer.fully_connected.biases,
             array![1.09933071491, -0.0993307149],
-            epsilon = 1e-10
+            epsilon = 1e-6
         );
 
         // weights -= (output - target) * input * learning_rate
@@ -638,7 +735,7 @@ mod tests {
                 [3.19866142982, 3.80133857019],
                 [5.29799214472, 5.70200785528],
             ],
-            epsilon = 1e-10
+            epsilon = 1e-6
         );
 
         // dloss_dinput = (output - target) * weights
@@ -647,8 +744,8 @@ mod tests {
         // dloss_dinput[2] = (0.00669285092 - 1) * 5 + (0.99330714907 - 0) * 6 = 0.99330714902
         assert_relative_eq!(
             dloss_dinput,
-            array![0.99330714906, 0.99330714904, 0.99330714902],
-            epsilon = 1e-10
+            array![[0.99330714906, 0.99330714904, 0.99330714902]],
+            epsilon = 1e-6
         );
     }
 
@@ -670,8 +767,8 @@ mod tests {
         let mut failures = 0;
         for _ in 0..iterations {
             let mut layer = make_random_layer(input_size, output_size);
-            let input = Array::random(input_size, Uniform::new(-1.0, 1.0));
-            let target = Array::random(output_size, Uniform::new(0.0, 1.0));
+            let input = Array::random((1, input_size), Uniform::new(-1.0, 1.0));
+            let target = Array::random((1, output_size), Uniform::new(0.0, 1.0));
 
             let output = layer.forward(&input.view());
             let loss = layer.loss(&output.view(), &target.view());
@@ -693,8 +790,9 @@ mod tests {
                     tested += 1;
                     if !relative_eq!(
                         new_loss,
-                        loss + perturbation
-                            * new_layer.fully_connected.dloss_dweights[[i, j]],
+                        &loss
+                            + perturbation
+                                * new_layer.fully_connected.dloss_dweights[[i, j]],
                         epsilon = epsilon,
                     ) {
                         warn!(
@@ -722,7 +820,7 @@ mod tests {
                 tested += 1;
                 if !relative_eq!(
                     new_loss,
-                    loss + perturbation * new_layer.fully_connected.dloss_dbiases[j],
+                    &loss + perturbation * new_layer.fully_connected.dloss_dbiases[j],
                     epsilon = epsilon,
                 ) {
                     warn!(
@@ -742,19 +840,22 @@ mod tests {
             // element perturbed by a small amount.
             for i in 0..input.len() {
                 let mut new_input = input.clone();
-                new_input[i] += perturbation;
+                new_input[[0, i]] += perturbation;
                 let new_output = layer.forward(&new_input.view());
                 let new_loss = layer.loss(&new_output.view(), &target.view());
 
                 tested += 1;
                 if !relative_eq!(
                     new_loss,
-                    loss + perturbation * dloss_dinput[i],
+                    &loss + perturbation * dloss_dinput[[0, i]],
                     epsilon = epsilon,
                 ) {
                     warn!(
                         "Updating input from {} to {} updated loss from {} to {}",
-                        input[i], new_input[i], loss, new_loss,
+                        input[[0, i]],
+                        new_input[[0, i]],
+                        loss,
+                        new_loss,
                     );
                     failures += 1;
                 }
