@@ -1,6 +1,14 @@
 use ndarray::{Array1, Array2, ArrayView2};
+use serde::Serialize;
 
-use crate::layers::{ActivationFunction, DropoutLayer, FullyConnectedLayer, Layer};
+use crate::layers::{
+    ActivationFunction, DropoutLayer, FullyConnectedLayer, Layer, LayerMetadata,
+};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkMetadata {
+    pub layers: Vec<LayerMetadata>,
+}
 
 /// A neural network.
 #[derive(Debug)]
@@ -16,6 +24,20 @@ impl Network {
             next_input_width: input_width,
             layers: vec![],
         }
+    }
+
+    /// Metadata about the network.
+    pub fn metadata(&self) -> NetworkMetadata {
+        let mut layers = vec![];
+        let mut input_width = self.next_input_width;
+
+        for layer in &self.layers {
+            let metadata = layer.metadata(input_width);
+            input_width = metadata.outputs;
+            layers.push(metadata);
+        }
+
+        NetworkMetadata { layers }
     }
 
     /// Add a fully connected layer, with the given number of inputs and outputs

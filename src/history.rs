@@ -1,10 +1,15 @@
 //! Training history for our neural network.
 
 use anyhow::{anyhow, Result};
+use serde::Serialize;
 
-use crate::network::Network;
+use crate::{
+    network::{Network, NetworkMetadata},
+    training::TrainOpt,
+};
 
 /// The results of a single epoch of training.
+#[derive(Debug, Clone, Serialize)]
 pub struct EpochStats {
     pub train_loss: f32,
     pub train_accuracy: f32,
@@ -13,17 +18,38 @@ pub struct EpochStats {
 }
 
 /// The history of a neural network's training.
+#[derive(Debug, Clone, Serialize)]
 pub struct TrainingHistory {
+    /// The name of the dataset used for training.
+    dataset_name: String,
+
+    /// The options used for this training run.
+    opt: TrainOpt,
+
+    /// Metadata about the network, including the layers.
+    network: NetworkMetadata,
+
+    /// History of each epoch.
     epochs: Vec<EpochStats>,
+
+    /// The best test accuracy seen during training.
     best_test_accuracy: f32,
+
+    /// The epoch with the best test accuracy.
     best_epoch: usize,
+
+    /// The model with the best test accuracy.
+    #[serde(skip)]
     best_model: Option<Network>,
 }
 
 impl TrainingHistory {
     /// Create a new training history.
-    pub fn new() -> Self {
+    pub fn new(dataset_name: &str, opt: TrainOpt, network: &Network) -> Self {
         TrainingHistory {
+            dataset_name: dataset_name.to_string(),
+            opt,
+            network: network.metadata(),
             epochs: Vec::new(),
             best_test_accuracy: 0.0,
             best_epoch: 0,

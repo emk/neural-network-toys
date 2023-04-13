@@ -11,6 +11,8 @@ use std::fmt::Debug;
 
 use ndarray::{s, Array1, Array2, ArrayView2, Axis};
 use ndarray_rand::rand::seq::SliceRandom;
+use serde::Serialize;
+use serde_json::{json, Value};
 
 use crate::initialization::InitializationType;
 
@@ -24,6 +26,28 @@ const ARRAY2_EXAMPLES_AXIS: Axis = Axis(0);
 /// This is the inner set of brackets in `[[1, 2, 3], [4, 5, 6]]`.
 const ARRAY2_FEATURES_AXIS: Axis = Axis(1);
 
+/// Layer metadata. This is used to log information about our layers
+/// as part of our training history.
+#[derive(Debug, Clone, Serialize)]
+pub struct LayerMetadata {
+    /// The type of this layer.
+    #[serde(rename = "type")]
+    pub layer_type: String,
+
+    /// The number of inputs to this layer.
+    pub inputs: usize,
+
+    /// The number of outputs from this layer.
+    pub outputs: usize,
+
+    /// The number of parameters in this layer.
+    pub parameters: usize,
+
+    /// Any extra metadata we want to store.
+    #[serde(flatten)]
+    extra: Value,
+}
+
 /// A layer in our neural network.
 ///
 /// This is designed to support mini-batch gradient descent, so all
@@ -31,6 +55,22 @@ const ARRAY2_FEATURES_AXIS: Axis = Axis(1);
 pub trait Layer: Debug + Send + Sync + 'static {
     /// Return a boxed clone of this layer.
     fn boxed_clone(&self) -> Box<dyn Layer>;
+
+    /// The type of this layer.
+    fn layer_type(&self) -> &'static str;
+
+    /// Metadata for this layer. This is used to log information about our
+    /// layers as part of our training history.
+    fn metadata(&self, inputs: usize) -> LayerMetadata {
+        // By default, assume layers have the same number of inputs and outputs.
+        LayerMetadata {
+            layer_type: self.layer_type().to_owned(),
+            inputs,
+            outputs: inputs,
+            parameters: 0,
+            extra: json!({}),
+        }
+    }
 
     /// Perform the foward pass through this layer, returning the output.
     fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32>;
@@ -133,6 +173,21 @@ impl Layer for FullyConnectedLayer {
         Box::new(self.clone())
     }
 
+    fn layer_type(&self) -> &'static str {
+        "fully_connected"
+    }
+
+    fn metadata(&self, inputs: usize) -> LayerMetadata {
+        //assert_eq!(inputs, self.weights.len_of(Axis(0)));
+        LayerMetadata {
+            layer_type: self.layer_type().to_owned(),
+            inputs,
+            outputs: self.weights.len_of(Axis(1)),
+            parameters: self.weights.len() + self.biases.len(),
+            extra: json!({}),
+        }
+    }
+
     fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
         input.dot(&self.weights) + &self.biases
     }
@@ -209,6 +264,10 @@ impl Layer for TanhLayer {
         Box::new(self.clone())
     }
 
+    fn layer_type(&self) -> &'static str {
+        "tanh"
+    }
+
     fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
         input.mapv(|x| x.tanh())
     }
@@ -242,6 +301,20 @@ impl LeakyReluLayer {
 impl Layer for LeakyReluLayer {
     fn boxed_clone(&self) -> Box<dyn Layer> {
         Box::new(self.clone())
+    }
+
+    fn layer_type(&self) -> &'static str {
+        "leaky_relu"
+    }
+
+    fn metadata(&self, inputs: usize) -> LayerMetadata {
+        LayerMetadata {
+            layer_type: self.layer_type().to_owned(),
+            inputs,
+            outputs: inputs,
+            parameters: 0,
+            extra: json!({ "leak": self.leak }),
+        }
     }
 
     fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
@@ -278,6 +351,10 @@ impl SoftmaxLayer {
 impl Layer for SoftmaxLayer {
     fn boxed_clone(&self) -> Box<dyn Layer> {
         Box::new(self.clone())
+    }
+
+    fn layer_type(&self) -> &'static str {
+        "softmax"
     }
 
     fn forward(&self, inputs: &ArrayView2<f32>) -> Array2<f32> {
@@ -349,6 +426,20 @@ impl DropoutLayer {
 impl Layer for DropoutLayer {
     fn boxed_clone(&self) -> Box<dyn Layer> {
         Box::new(self.clone())
+    }
+
+    fn layer_type(&self) -> &'static str {
+        "dropout"
+    }
+
+    fn metadata(&self, inputs: usize) -> LayerMetadata {
+        LayerMetadata {
+            layer_type: self.layer_type().to_owned(),
+            inputs,
+            outputs: inputs,
+            parameters: 0,
+            extra: json!({ "keep_probability": self.keep_probability }),
+        }
     }
 
     fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
@@ -462,6 +553,10 @@ mod tests {
     impl<L: Layer + Clone> Layer for FullyConnectedWithActivation<L> {
         fn boxed_clone(&self) -> Box<dyn Layer> {
             Box::new(self.clone())
+        }
+
+        fn layer_type(&self) -> &'static str {
+            "test_layer"
         }
 
         fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {

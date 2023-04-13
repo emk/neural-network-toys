@@ -1,11 +1,17 @@
 ///! Our core training code.
-use std::{cmp::min, path::PathBuf};
+use std::{
+    cmp::min,
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use log::{debug, trace};
 use ndarray::{s, Array2, ArrayView1};
 use rand::seq::SliceRandom;
+use serde::Serialize;
 
 use crate::{
     history::{EpochStats, TrainingHistory},
@@ -14,8 +20,12 @@ use crate::{
     plot::plot_loss,
 };
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser, Serialize)]
 pub struct TrainOpt {
+    /// Path to a JSONL file which will be used to log training history.
+    #[arg(long = "history", default_value = "history.jsonl")]
+    pub history_path: PathBuf,
+
     // Parameters are number of epochs, the training/test split, the learning rate, and size of input (4), hidden (7) and output (3) layers.
     /// Number of epochs.
     #[arg(long = "epochs", default_value = "2000")]
@@ -76,11 +86,12 @@ pub struct TrainAndTestData {
 /// First attempt at a training function, originally written largely by Copilot
 /// but revised heavily since.
 pub fn train(
+    dataset_name: &str,
     opt: TrainOpt,
     network: &mut Network,
     training_data: &TrainAndTestData,
 ) -> Result<()> {
-    let mut history = TrainingHistory::new();
+    let mut history = TrainingHistory::new(dataset_name, opt.clone(), network);
     let mut rng = rand::thread_rng();
     'epochs: for epoch in 0..opt.epochs {
         debug!("Model: {:#?}", network);
@@ -207,6 +218,11 @@ pub fn train(
         plot_loss(&plot_path, &epoch_training_losses, &epoch_test_losses)?;
     }
 
+    // Append history to a JSONL file.
+    append_history_as_jsonl(&opt.history_path, &history).with_context(|| {
+        format!("failed to save history to {}", opt.history_path.display())
+    })?;
+
     // TODO: Reimplement `Network::save`.
 
     Ok(())
@@ -220,4 +236,18 @@ fn predicted_class_index(output: &ArrayView1<f32>) -> usize {
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .unwrap()
         .0
+}
+
+fn append_history_as_jsonl(
+    history_path: &Path,
+    history: &TrainingHistory,
+) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(history_path)?;
+    serde_json::to_writer(&mut file, history)?;
+    writeln!(file)?;
+    file.flush()?;
+    Ok(())
 }

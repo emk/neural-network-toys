@@ -112,7 +112,7 @@ fn train_iris(opt: IrisOpt) -> Result<()> {
     network.add_dropout_layer(1.0 - opt.train.dropout);
     network.add_fully_connected_layer(class_count, ActivationFunction::Softmax);
 
-    train(opt.train, &mut network, &train_and_test_data)
+    train("iris", opt.train, &mut network, &train_and_test_data)
 }
 
 /// Read the MNIST data from a file using the `minist` crate and train a neural
@@ -156,5 +156,5 @@ fn train_mnist(opt: MnistOpt) -> Result<()> {
     }
     network.add_fully_connected_layer(num_digits, ActivationFunction::Softmax);
 
-    train(opt.train, &mut network, &train_and_test_data)
+    train("mnist", opt.train, &mut network, &train_and_test_data)
 }
