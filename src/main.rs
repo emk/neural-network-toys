@@ -70,6 +70,11 @@ struct TrainOpt {
     #[arg(long = "dropout", default_value = "0.5")]
     dropout: f32,
 
+    /// Which activation function should we use? Does not apply to the output
+    /// layer, which always uses softmax.
+    #[arg(long = "activation", default_value = "tanh", value_names = ["leaky_relu", "tanh"])]
+    activation: String,
+
     /// Leaky ReLU alpha.
     #[arg(long = "relu-leak", default_value = "0.01")]
     relu_leak: f32,
@@ -82,6 +87,16 @@ struct TrainOpt {
     /// Path to save plot of training and test loss.
     #[arg(long = "plot")]
     plot: Option<PathBuf>,
+}
+
+impl TrainOpt {
+    fn activation(&self) -> ActivationFunction {
+        match self.activation.as_str() {
+            "leaky_relu" => ActivationFunction::LeakyReLU(self.relu_leak),
+            "tanh" => ActivationFunction::Tanh,
+            _ => panic!("Unknown activation function"),
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -139,18 +154,11 @@ fn train_iris(opt: IrisOpt) -> Result<()> {
         train_and_test_data.test_inputs.nrows()
     );
 
-    let mut network = Network::new();
-    network.add_fully_connected_layer(
-        feature_count,
-        opt.hidden_layer_width,
-        ActivationFunction::Tanh,
-    );
-    network.add_dropout_layer(opt.hidden_layer_width, 1.0 - opt.train.dropout);
-    network.add_fully_connected_layer(
-        opt.hidden_layer_width,
-        class_count,
-        ActivationFunction::Softmax,
-    );
+    let mut network = Network::new(feature_count);
+    let activation = opt.train.activation();
+    network.add_fully_connected_layer(opt.hidden_layer_width, activation);
+    network.add_dropout_layer(1.0 - opt.train.dropout);
+    network.add_fully_connected_layer(class_count, ActivationFunction::Softmax);
 
     train(opt.train, &mut network, &train_and_test_data)
 }
@@ -187,31 +195,14 @@ fn train_mnist(opt: MnistOpt) -> Result<()> {
         test_targets: array2_f32_from_vec_u8(mnist.tst_lbl, num_digits),
     };
 
-    let mut network = Network::new();
-    network.add_fully_connected_layer(
-        img_size,
-        opt.hidden_layer_width,
-        ActivationFunction::Tanh,
-        // ActivationFunction::LeakyReLU {
-        //     leak: opt.train.relu_leak,
-        // },
-    );
+    let mut network = Network::new(img_size);
+    let activation = opt.train.activation();
+    network.add_fully_connected_layer(opt.hidden_layer_width, activation);
     for _ in 1..opt.hidden_layers {
-        network.add_fully_connected_layer(
-            opt.hidden_layer_width,
-            opt.hidden_layer_width,
-            ActivationFunction::Tanh,
-            // ActivationFunction::LeakyReLU {
-            //     leak: opt.train.relu_leak,
-            // },
-        );
-        network.add_dropout_layer(opt.hidden_layer_width, 1.0 - opt.train.dropout);
+        network.add_fully_connected_layer(opt.hidden_layer_width, activation);
+        network.add_dropout_layer(1.0 - opt.train.dropout);
     }
-    network.add_fully_connected_layer(
-        opt.hidden_layer_width,
-        num_digits,
-        ActivationFunction::Softmax,
-    );
+    network.add_fully_connected_layer(num_digits, ActivationFunction::Softmax);
 
     train(opt.train, &mut network, &train_and_test_data)
 }

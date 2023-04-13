@@ -314,9 +314,10 @@ impl Layer for DropoutLayer {
 }
 
 /// Activation functions we support.
+#[derive(Debug, Clone, Copy)]
 pub enum ActivationFunction {
     Tanh,
-    LeakyReLU { leak: f32 },
+    LeakyReLU(f32),
     Softmax,
 }
 
@@ -325,7 +326,7 @@ impl ActivationFunction {
     pub fn layer(&self) -> Box<dyn Layer> {
         match self {
             ActivationFunction::Tanh => Box::new(TanhLayer::new()),
-            ActivationFunction::LeakyReLU { leak } => {
+            ActivationFunction::LeakyReLU(leak) => {
                 Box::new(LeakyReluLayer::new(*leak))
             }
             ActivationFunction::Softmax => Box::new(SoftmaxLayer::new()),
@@ -337,7 +338,7 @@ impl ActivationFunction {
     pub fn input_weight_inititialization_type(&self) -> InitializationType {
         match self {
             ActivationFunction::Tanh => InitializationType::Xavier,
-            ActivationFunction::LeakyReLU { .. } => InitializationType::He,
+            ActivationFunction::LeakyReLU(_) => InitializationType::He,
             ActivationFunction::Softmax => InitializationType::Xavier,
         }
     }
@@ -346,28 +347,23 @@ impl ActivationFunction {
 /// A neural network.
 #[derive(Debug)]
 pub struct Network {
+    next_input_width: usize,
     layers: Vec<Box<dyn Layer>>,
 }
 
 impl Network {
-    /// Create a new network.
-    pub fn new() -> Self {
-        Self { layers: vec![] }
-    }
-
-    /// Add a layer to the network.
-    pub fn add_layer<L>(&mut self, layer: L)
-    where
-        L: Layer + 'static,
-    {
-        self.layers.push(Box::new(layer));
+    /// Create a new network with the specified number of inputs.
+    pub fn new(input_width: usize) -> Self {
+        Self {
+            next_input_width: input_width,
+            layers: vec![],
+        }
     }
 
     /// Add a fully connected layer, with the given number of inputs and outputs
     /// and the given activation function.
     pub fn add_fully_connected_layer(
         &mut self,
-        input_width: usize,
         output_width: usize,
         activation_function: ActivationFunction,
     ) {
@@ -375,18 +371,19 @@ impl Network {
             activation_function.input_weight_inititialization_type();
         let fully_connected = FullyConnectedLayer::new(
             input_weight_initialization_type,
-            input_width,
+            self.next_input_width,
             output_width,
         );
-        self.add_layer(fully_connected);
+        self.next_input_width = output_width;
+        self.layers.push(Box::new(fully_connected));
         self.layers.push(activation_function.layer());
     }
 
     /// Add a dropout layer, with the given keep probability. This is only used
     /// during training.
-    pub fn add_dropout_layer(&mut self, width: usize, keep_probability: f32) {
-        let dropout = DropoutLayer::new(width, keep_probability);
-        self.add_layer(dropout);
+    pub fn add_dropout_layer(&mut self, keep_probability: f32) {
+        let dropout = DropoutLayer::new(self.next_input_width, keep_probability);
+        self.layers.push(Box::new(dropout));
     }
 
     /// Get the last layer of the network.
@@ -447,6 +444,7 @@ impl Network {
 impl Clone for Network {
     fn clone(&self) -> Self {
         Self {
+            next_input_width: self.next_input_width,
             layers: self.layers.iter().map(|l| l.boxed_clone()).collect(),
         }
     }
