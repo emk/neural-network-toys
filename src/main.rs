@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use csv;
-use layers::LeakyReluLayer;
 use log::debug;
 use mnist::MnistBuilder;
 use ndarray::{Array1, Array2, ArrayView1};
@@ -30,10 +29,14 @@ use plotters_svg::SVGBackend;
 use rand::seq::SliceRandom;
 
 mod history;
+mod initialization;
 mod layers;
 
-use crate::history::{EpochStats, TrainingHistory};
-use crate::layers::{DropoutLayer, Network, SoftmaxLayer, TanhLayer};
+use crate::layers::Network;
+use crate::{
+    history::{EpochStats, TrainingHistory},
+    layers::ActivationFunction,
+};
 
 #[derive(Debug, Parser)]
 #[structopt(about = "Neural network experiments")]
@@ -136,13 +139,18 @@ fn train_iris(opt: IrisOpt) -> Result<()> {
         train_and_test_data.test_inputs.nrows()
     );
 
-    let mut network =
-        Network::new(TanhLayer::new(feature_count, opt.hidden_layer_width));
-    network.add_layer(DropoutLayer::new(
+    let mut network = Network::new();
+    network.add_fully_connected_layer(
+        feature_count,
         opt.hidden_layer_width,
-        1.0 - opt.train.dropout,
-    ));
-    network.add_layer(SoftmaxLayer::new(opt.hidden_layer_width, class_count));
+        ActivationFunction::Tanh,
+    );
+    network.add_dropout_layer(opt.hidden_layer_width, 1.0 - opt.train.dropout);
+    network.add_fully_connected_layer(
+        opt.hidden_layer_width,
+        class_count,
+        ActivationFunction::Softmax,
+    );
 
     train(opt.train, &mut network, &train_and_test_data)
 }
@@ -179,23 +187,31 @@ fn train_mnist(opt: MnistOpt) -> Result<()> {
         test_targets: array2_f32_from_vec_u8(mnist.tst_lbl, num_digits),
     };
 
-    let mut network = Network::new(LeakyReluLayer::new(
+    let mut network = Network::new();
+    network.add_fully_connected_layer(
         img_size,
         opt.hidden_layer_width,
-        opt.train.relu_leak,
-    ));
+        ActivationFunction::Tanh,
+        // ActivationFunction::LeakyReLU {
+        //     leak: opt.train.relu_leak,
+        // },
+    );
     for _ in 1..opt.hidden_layers {
-        network.add_layer(LeakyReluLayer::new(
+        network.add_fully_connected_layer(
             opt.hidden_layer_width,
             opt.hidden_layer_width,
-            opt.train.relu_leak,
-        ));
-        network.add_layer(DropoutLayer::new(
-            opt.hidden_layer_width,
-            1.0f32 - opt.train.dropout,
-        ));
+            ActivationFunction::Tanh,
+            // ActivationFunction::LeakyReLU {
+            //     leak: opt.train.relu_leak,
+            // },
+        );
+        network.add_dropout_layer(opt.hidden_layer_width, 1.0 - opt.train.dropout);
     }
-    network.add_layer(SoftmaxLayer::new(opt.hidden_layer_width, num_digits));
+    network.add_fully_connected_layer(
+        opt.hidden_layer_width,
+        num_digits,
+        ActivationFunction::Softmax,
+    );
 
     train(opt.train, &mut network, &train_and_test_data)
 }

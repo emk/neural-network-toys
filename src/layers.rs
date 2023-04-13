@@ -1,110 +1,9 @@
 use std::fmt::Debug;
 
 use ndarray::{s, Array1, Array2, ArrayView1};
-use ndarray_rand::{
-    rand::seq::SliceRandom,
-    rand_distr::{Normal, Uniform},
-    RandomExt,
-};
+use ndarray_rand::rand::seq::SliceRandom;
 
-/// [Xavier][] initialization is a good default for initializing weights in a
-/// layer, with the [exception][] of layers using ReLU or SELU activations.
-///
-/// [Xavier]: http://proceedings.mlr.press/v9/glorot10a/glorot10a.pdf
-/// [exception]: https://stats.stackexchange.com/a/393012
-fn xavier(input_size: usize, output_size: usize) -> Array2<f32> {
-    let weights = Array2::random((input_size, output_size), Uniform::new(-1.0, 1.0));
-    weights / (input_size as f32).sqrt()
-}
-
-/// [He][] initialization is a good default for initializing weights in a layer
-/// with ReLU or SELU activations.
-///
-/// [He]: https://arxiv.org/abs/1502.01852
-fn he(input_size: usize, output_size: usize) -> Array2<f32> {
-    Array2::random(
-        (input_size, output_size),
-        Normal::new(0.0, (2.0 / input_size as f32).sqrt())
-            .expect("invalid normal distribution"),
-    )
-}
-
-/// Gradient associated with a fully-connected layer.
-pub struct FullyConnectedGradient {
-    dloss_dbiases: Array1<f32>,
-    dloss_dweights: Array2<f32>,
-    dloss_dinput: Array1<f32>,
-}
-
-/// Fully-connected feed-forward layer without an activation function.
-#[derive(Debug, Clone)]
-struct FullyConnected {
-    weights: Array2<f32>,
-    biases: Array1<f32>,
-}
-
-impl FullyConnected {
-    /// Contruct using random Xavier weights.
-    fn xavier(input_size: usize, output_size: usize) -> Self {
-        let weights = xavier(input_size, output_size);
-        let biases = Array1::zeros(output_size);
-        Self { weights, biases }
-    }
-
-    /// Contruct using random He weights.
-    fn he(input_size: usize, output_size: usize) -> Self {
-        let weights = he(input_size, output_size);
-        let biases = Array1::zeros(output_size);
-        Self { weights, biases }
-    }
-
-    /// Compute the output of this layer.
-    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
-        input.dot(&self.weights) + &self.biases
-    }
-
-    /// Given  ∂loss/∂output, compute ∂loss/∂biases, ∂loss/∂weights, and ∂loss/∂input.
-    fn gradient(
-        &self,
-        input: &ArrayView1<f32>,
-        dloss_doutput: &ArrayView1<f32>,
-    ) -> FullyConnectedGradient {
-        // ∂loss/∂biases = ∂loss/∂output * ∂output/∂biases
-        //               = dloss_doutput * 1
-        let dloss_dbiases = dloss_doutput.to_owned();
-
-        // ∂loss/∂weights = ∂loss/∂output * ∂output/∂weights
-        //                = ∂loss_doutput * input
-        //
-        // We need to do this manually, because the `outer` method is not
-        // supported by ndarray.
-        let mut dloss_dweights = Array2::zeros((input.len(), dloss_doutput.len()));
-        for (i, x) in input.iter().enumerate() {
-            for (j, y) in dloss_doutput.iter().enumerate() {
-                dloss_dweights[[i, j]] = x * y;
-            }
-        }
-
-        // ∂loss/∂input = ∂loss/∂output * ∂output/∂input
-        //              = dloss_doutput * weights
-        let dloss_dinput = dloss_doutput.dot(&self.weights.t());
-
-        FullyConnectedGradient {
-            dloss_dbiases,
-            dloss_dweights,
-            dloss_dinput,
-        }
-    }
-
-    /// Update the weights and biases of this layer.
-    ///
-    /// We subtract the gradient because we are minimizing the loss, and going
-    /// "downhill" (which is why we call this "gradient descent")!
-    fn update(&mut self, gradient: &FullyConnectedGradient, learning_rate: f32) {
-        self.biases = &self.biases - learning_rate * &gradient.dloss_dbiases;
-        self.weights = &self.weights - learning_rate * &gradient.dloss_dweights;
-    }
-}
+use crate::initialization::InitializationType;
 
 /// A layer in our neural network.
 pub trait Layer: Debug + Send + Sync + 'static {
@@ -142,49 +41,97 @@ pub trait Layer: Debug + Send + Sync + 'static {
     /// dropped neurons.
     fn end_training_step(&mut self) {}
 
-    /// Update the weights and biases of this layer, and return `dloss_dinput`.
-    fn update(
+    /// Perform the backward pass through this layer, returning `dloss_dinput`
+    /// as input for the previous layer.
+    ///
+    /// We pass in ∂loss/∂output, and we return and ∂loss/∂input. We also compute
+    /// ∂loss/∂biases and ∂loss/∂weights (when applicable) and store them.
+    fn backward(
         &mut self,
         input: &ArrayView1<f32>,
         dloss_doutput: &ArrayView1<f32>,
-        learning_rate: f32,
     ) -> Array1<f32>;
+
+    /// Update the weights and biases of this layer, and return `dloss_dinput`.
+    fn update(&mut self, _learning_rate: f32) {}
 }
 
-/// `Layer` methods that require knowing the gradient type, or that are
-/// are not object-safe.
-pub trait LayerStatic: Layer + Clone + Sized {
-    /// The gradient type associated with this layer.
-    type Gradient;
+/// Fully-connected feed-forward layer without an activation function.
+#[derive(Debug, Clone)]
+struct FullyConnectedLayer {
+    weights: Array2<f32>,
+    biases: Array1<f32>,
 
-    /// Compute the gradient of this layer.
-    fn gradient(
-        &self,
+    dloss_dbiases: Array1<f32>,
+    dloss_dweights: Array2<f32>,
+}
+
+impl FullyConnectedLayer {
+    /// Contruct using random weights.
+    fn new(
+        initialization_type: InitializationType,
+        input_size: usize,
+        output_size: usize,
+    ) -> Self {
+        Self {
+            weights: initialization_type.weights(input_size, output_size),
+            biases: Array1::zeros(output_size),
+            dloss_dbiases: Array1::zeros(output_size),
+            dloss_dweights: Array2::zeros((input_size, output_size)),
+        }
+    }
+}
+
+impl Layer for FullyConnectedLayer {
+    fn boxed_clone(&self) -> Box<dyn Layer> {
+        Box::new(self.clone())
+    }
+
+    fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
+        input.dot(&self.weights) + &self.biases
+    }
+
+    fn backward(
+        &mut self,
         input: &ArrayView1<f32>,
         dloss_doutput: &ArrayView1<f32>,
-    ) -> Self::Gradient;
-}
+    ) -> Array1<f32> {
+        // ∂loss/∂biases = ∂loss/∂output * ∂output/∂biases
+        //               = dloss_doutput * 1
+        self.dloss_dbiases = dloss_doutput.to_owned();
 
-/// A layer that has weights and biases. Useful for things like numerical gradient checking.
-trait LayerWeightsAndBiases: LayerStatic {
-    fn weights(&self) -> &Array2<f32>;
-    fn biases(&self) -> &Array1<f32>;
-    fn weights_mut(&mut self) -> &mut Array2<f32>;
-    fn biases_mut(&mut self) -> &mut Array1<f32>;
+        // ∂loss/∂weights = ∂loss/∂output * ∂output/∂weights
+        //                = ∂loss_doutput * input
+        //
+        // We need to do this manually, because the `outer` method is not
+        // supported by ndarray.
+        self.dloss_dweights = Array2::zeros((input.len(), dloss_doutput.len()));
+        for (i, x) in input.iter().enumerate() {
+            for (j, y) in dloss_doutput.iter().enumerate() {
+                self.dloss_dweights[[i, j]] = x * y;
+            }
+        }
+
+        // ∂loss/∂input = ∂loss/∂output * ∂output/∂input
+        //              = dloss_doutput * weights
+        dloss_doutput.dot(&self.weights.t())
+    }
+
+    fn update(&mut self, learning_rate: f32) {
+        self.weights = &self.weights - learning_rate * &self.dloss_dweights;
+        self.biases = &self.biases - learning_rate * &self.dloss_dbiases;
+    }
 }
 
 /// A layer using the tanh activation function. This is a good default for
 /// hidden layers.
 #[derive(Debug, Clone)]
-pub struct TanhLayer {
-    fully_connected: FullyConnected,
-}
+pub struct TanhLayer {}
 
 impl TanhLayer {
-    /// Initialize `TanhLayer` using random weights.
-    pub fn new(input_size: usize, output_size: usize) -> Self {
-        let fully_connected = FullyConnected::xavier(input_size, output_size);
-        Self { fully_connected }
+    /// Initialize `TanhLayer`.
+    pub fn new() -> Self {
+        Self {}
     }
 }
 
@@ -194,59 +141,17 @@ impl Layer for TanhLayer {
     }
 
     fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
-        self.fully_connected.forward(input).mapv(|x| x.tanh())
+        input.mapv(|x| x.tanh())
     }
 
-    fn update(
+    fn backward(
         &mut self,
         input: &ArrayView1<f32>,
         dloss_doutput: &ArrayView1<f32>,
-        learning_rate: f32,
     ) -> Array1<f32> {
-        let gradient = self.gradient(input, dloss_doutput);
-        self.fully_connected.update(&gradient, learning_rate);
-        gradient.dloss_dinput
-    }
-}
-
-impl LayerStatic for TanhLayer {
-    type Gradient = FullyConnectedGradient;
-
-    fn gradient(
-        &self,
-        input: &ArrayView1<f32>,
-        dloss_doutput: &ArrayView1<f32>,
-    ) -> Self::Gradient {
-        // TODO: Store `fully_connected.forward(input)` in `forward` so we don't
-        // have to compute it again.
-
-        // ∂loss/∂preactivation = ∂loss/∂output * ∂output/∂preactivation
-        //                      = dloss_doutput * (1 - tanh^2(output))
-        let preactivation = self.fully_connected.forward(input);
-        let tanh_squared = preactivation.mapv(|x| x.tanh()).mapv(|x| x * x);
-        let dloss_dpreativation = dloss_doutput * (1.0 - tanh_squared);
-
-        // Now we can compute our gradient.
-        self.fully_connected
-            .gradient(input, &dloss_dpreativation.view())
-    }
-}
-
-impl LayerWeightsAndBiases for TanhLayer {
-    fn weights(&self) -> &Array2<f32> {
-        &self.fully_connected.weights
-    }
-
-    fn biases(&self) -> &Array1<f32> {
-        &self.fully_connected.biases
-    }
-
-    fn weights_mut(&mut self) -> &mut Array2<f32> {
-        &mut self.fully_connected.weights
-    }
-
-    fn biases_mut(&mut self) -> &mut Array1<f32> {
-        &mut self.fully_connected.biases
+        // ∂loss/∂input = ∂loss/∂output * ∂output/∂input
+        //              = dloss_doutput * (1 - tanh^2(x))
+        dloss_doutput * &(1.0 - input.mapv(|x| x.tanh().powi(2)))
     }
 }
 
@@ -254,19 +159,14 @@ impl LayerWeightsAndBiases for TanhLayer {
 /// and used in many state of the art neural networks.
 #[derive(Debug, Clone)]
 pub struct LeakyReluLayer {
-    fully_connected: FullyConnected,
     /// The slope of the leaky ReLU function at negative values.
     leak: f32,
 }
 
 impl LeakyReluLayer {
-    /// Initialize `ReluLayer` using random weights.
-    pub fn new(input_size: usize, output_size: usize, leak: f32) -> Self {
-        let fully_connected = FullyConnected::he(input_size, output_size);
-        Self {
-            fully_connected,
-            leak,
-        }
+    /// Initialize `ReluLayer`.
+    pub fn new(leak: f32) -> Self {
+        Self { leak }
     }
 }
 
@@ -276,65 +176,17 @@ impl Layer for LeakyReluLayer {
     }
 
     fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
-        self.fully_connected.forward(input).mapv(|x| {
-            if x > 0.0 {
-                x
-            } else {
-                x * self.leak
-            }
-        })
+        input.mapv(|x| if x > 0.0 { x } else { x * self.leak })
     }
 
-    fn update(
+    fn backward(
         &mut self,
-        input: &ArrayView1<f32>,
+        _input: &ArrayView1<f32>,
         dloss_doutput: &ArrayView1<f32>,
-        learning_rate: f32,
     ) -> Array1<f32> {
-        let gradient = self.gradient(input, dloss_doutput);
-        self.fully_connected.update(&gradient, learning_rate);
-        gradient.dloss_dinput
-    }
-}
-
-impl LayerStatic for LeakyReluLayer {
-    type Gradient = FullyConnectedGradient;
-
-    fn gradient(
-        &self,
-        input: &ArrayView1<f32>,
-        dloss_doutput: &ArrayView1<f32>,
-    ) -> Self::Gradient {
-        // TODO: Store `fully_connected.forward(input)` in `forward` so we don't
-        // have to compute it again.
-
-        // ∂loss/∂preactivation = ∂loss/∂output * ∂output/∂preactivation
-        //                      = dloss_doutput * (1 if preactivation > 0 else 0)
-        let preactivation = self.fully_connected.forward(input);
-        let dloss_dpreativation = dloss_doutput
-            * (preactivation.mapv(|x| if x > 0.0 { 1.0 } else { self.leak }));
-
-        // Now we can compute our gradient.
-        self.fully_connected
-            .gradient(input, &dloss_dpreativation.view())
-    }
-}
-
-impl LayerWeightsAndBiases for LeakyReluLayer {
-    fn weights(&self) -> &Array2<f32> {
-        &self.fully_connected.weights
-    }
-
-    fn biases(&self) -> &Array1<f32> {
-        &self.fully_connected.biases
-    }
-
-    fn weights_mut(&mut self) -> &mut Array2<f32> {
-        &mut self.fully_connected.weights
-    }
-
-    fn biases_mut(&mut self) -> &mut Array1<f32> {
-        &mut self.fully_connected.biases
+        // ∂loss/∂input = ∂loss/∂output * ∂output/∂input
+        //              = dloss_doutput * (1 if x > 0 else leak)
+        dloss_doutput.mapv(|x| if x > 0.0 { x } else { x * self.leak })
     }
 }
 
@@ -342,15 +194,12 @@ impl LayerWeightsAndBiases for LeakyReluLayer {
 /// This is a good default for an output layer that chooses between multiple
 /// discrete output values.
 #[derive(Debug, Clone)]
-pub struct SoftmaxLayer {
-    fully_connected: FullyConnected,
-}
+pub struct SoftmaxLayer {}
 
 impl SoftmaxLayer {
-    /// Initialize `SoftmaxLayer` using random weights.
-    pub fn new(input_size: usize, output_size: usize) -> Self {
-        let fully_connected = FullyConnected::xavier(input_size, output_size);
-        Self { fully_connected }
+    /// Initialize `SoftmaxLayer`.
+    pub fn new() -> Self {
+        Self {}
     }
 }
 
@@ -360,12 +209,20 @@ impl Layer for SoftmaxLayer {
     }
 
     fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
-        let output = self.fully_connected.forward(input);
-
         // Softmax is exp(x) / sum(exp(x)).
-        let output = output.mapv(|x| x.exp());
+        let output = input.mapv(|x| x.exp());
         let sum = output.sum();
         output / sum
+    }
+
+    fn backward(
+        &mut self,
+        _input: &ArrayView1<f32>,
+        dloss_doutput: &ArrayView1<f32>,
+    ) -> Array1<f32> {
+        // This seems suspiciously convenient, but see
+        // https://towardsdatascience.com/derivative-of-the-softmax-function-and-the-categorical-cross-entropy-loss-ffceefc081d1
+        dloss_doutput.to_owned()
     }
 
     fn loss(&self, output: &ArrayView1<f32>, target: &ArrayView1<f32>) -> f32 {
@@ -385,49 +242,6 @@ impl Layer for SoftmaxLayer {
         // See
         // https://towardsdatascience.com/derivative-of-the-softmax-function-and-the-categorical-cross-entropy-loss-ffceefc081d1
         output - target
-    }
-
-    fn update(
-        &mut self,
-        input: &ArrayView1<f32>,
-        dloss_doutput: &ArrayView1<f32>,
-        learning_rate: f32,
-    ) -> Array1<f32> {
-        let gradient = self.gradient(input, dloss_doutput);
-        self.fully_connected.update(&gradient, learning_rate);
-        gradient.dloss_dinput
-    }
-}
-
-impl LayerStatic for SoftmaxLayer {
-    type Gradient = FullyConnectedGradient;
-
-    fn gradient(
-        &self,
-        input: &ArrayView1<f32>,
-        dloss_doutput: &ArrayView1<f32>,
-    ) -> Self::Gradient {
-        // This seems suspiciously convenient, but see
-        // https://towardsdatascience.com/derivative-of-the-softmax-function-and-the-categorical-cross-entropy-loss-ffceefc081d1
-        self.fully_connected.gradient(input, dloss_doutput)
-    }
-}
-
-impl LayerWeightsAndBiases for SoftmaxLayer {
-    fn weights(&self) -> &Array2<f32> {
-        &self.fully_connected.weights
-    }
-
-    fn biases(&self) -> &Array1<f32> {
-        &self.fully_connected.biases
-    }
-
-    fn weights_mut(&mut self) -> &mut Array2<f32> {
-        &mut self.fully_connected.weights
-    }
-
-    fn biases_mut(&mut self) -> &mut Array1<f32> {
-        &mut self.fully_connected.biases
     }
 }
 
@@ -464,6 +278,17 @@ impl Layer for DropoutLayer {
         input * &self.mask
     }
 
+    fn backward(
+        &mut self,
+        _input: &ArrayView1<f32>,
+        dloss_doutput: &ArrayView1<f32>,
+    ) -> Array1<f32> {
+        // See https://deepnotes.io/dropout for a discussion of gradients and
+        // dropout. Since we're scaling the output by the keep probability,
+        // I guess we need to scale the gradient by the same amount?
+        dloss_doutput * &self.mask
+    }
+
     /// Randomize our mask for training.
     fn start_training_step(&mut self) {
         // We need to scale the mask, so that the expected value of the output
@@ -486,17 +311,35 @@ impl Layer for DropoutLayer {
     fn end_training_step(&mut self) {
         self.mask.fill(1.0);
     }
+}
 
-    fn update(
-        &mut self,
-        _input: &ArrayView1<f32>,
-        dloss_doutput: &ArrayView1<f32>,
-        _learning_rate: f32,
-    ) -> Array1<f32> {
-        // See https://deepnotes.io/dropout for a discussion of gradients and
-        // dropout. Since we're scaling the output by the keep probability,
-        // I guess we need to scale the gradient by the same amount?
-        dloss_doutput * &self.mask
+/// Activation functions we support.
+pub enum ActivationFunction {
+    Tanh,
+    LeakyReLU { leak: f32 },
+    Softmax,
+}
+
+impl ActivationFunction {
+    /// Construct a layer that applies this activation function.
+    pub fn layer(&self) -> Box<dyn Layer> {
+        match self {
+            ActivationFunction::Tanh => Box::new(TanhLayer::new()),
+            ActivationFunction::LeakyReLU { leak } => {
+                Box::new(LeakyReluLayer::new(*leak))
+            }
+            ActivationFunction::Softmax => Box::new(SoftmaxLayer::new()),
+        }
+    }
+
+    /// How should we initialize the weights for the layer feeding into this
+    /// activation function?
+    pub fn input_weight_inititialization_type(&self) -> InitializationType {
+        match self {
+            ActivationFunction::Tanh => InitializationType::Xavier,
+            ActivationFunction::LeakyReLU { .. } => InitializationType::He,
+            ActivationFunction::Softmax => InitializationType::Xavier,
+        }
     }
 }
 
@@ -507,14 +350,9 @@ pub struct Network {
 }
 
 impl Network {
-    /// Create a new network, specifying the first layer.
-    pub fn new<L>(layer: L) -> Self
-    where
-        L: Layer + 'static,
-    {
-        Self {
-            layers: vec![Box::new(layer)],
-        }
+    /// Create a new network.
+    pub fn new() -> Self {
+        Self { layers: vec![] }
     }
 
     /// Add a layer to the network.
@@ -523,6 +361,32 @@ impl Network {
         L: Layer + 'static,
     {
         self.layers.push(Box::new(layer));
+    }
+
+    /// Add a fully connected layer, with the given number of inputs and outputs
+    /// and the given activation function.
+    pub fn add_fully_connected_layer(
+        &mut self,
+        input_width: usize,
+        output_width: usize,
+        activation_function: ActivationFunction,
+    ) {
+        let input_weight_initialization_type =
+            activation_function.input_weight_inititialization_type();
+        let fully_connected = FullyConnectedLayer::new(
+            input_weight_initialization_type,
+            input_width,
+            output_width,
+        );
+        self.add_layer(fully_connected);
+        self.layers.push(activation_function.layer());
+    }
+
+    /// Add a dropout layer, with the given keep probability. This is only used
+    /// during training.
+    pub fn add_dropout_layer(&mut self, width: usize, keep_probability: f32) {
+        let dropout = DropoutLayer::new(width, keep_probability);
+        self.add_layer(dropout);
     }
 
     /// Get the last layer of the network.
@@ -558,19 +422,19 @@ impl Network {
         }
 
         // Forward pass.
-        let mut outputs = vec![input.to_owned()];
+        let mut inputs = vec![input.to_owned()];
         for layer in &self.layers {
-            let output = layer.forward(&outputs.last().unwrap().view());
-            outputs.push(output);
+            inputs.push(layer.forward(&inputs.last().unwrap().view()));
         }
-        let output = outputs.last().unwrap();
+        let output = inputs.pop().unwrap();
+        assert_eq!(inputs.len(), self.layers.len());
 
         // Backward pass.
         let mut dloss_doutput =
             self.last_layer().dloss_doutput(&output.view(), &target);
-        for (layer, output) in self.layers.iter_mut().zip(outputs.into_iter()).rev() {
-            dloss_doutput =
-                layer.update(&output.view(), &dloss_doutput.view(), learning_rate);
+        for (layer, output) in self.layers.iter_mut().zip(inputs.into_iter()).rev() {
+            dloss_doutput = layer.backward(&output.view(), &dloss_doutput.view());
+            layer.update(learning_rate);
         }
 
         // End training on all layers.
@@ -593,17 +457,80 @@ mod tests {
     use approx::{assert_relative_eq, relative_eq};
     use log::warn;
     use ndarray::{array, Array};
+    use ndarray_rand::{rand_distr::Uniform, RandomExt};
 
     use super::*;
 
+    /// Backwards compatibility for tests that were written before we had
+    /// separate layers for fully connected layers and activation layers.
+    #[derive(Clone, Debug)]
+    struct FullyConnectedWithActivation<L: Layer + Clone> {
+        fully_connected: FullyConnectedLayer,
+        activation_layer: L,
+    }
+
+    impl<L: Layer + Clone> FullyConnectedWithActivation<L> {
+        fn new(fully_connected: FullyConnectedLayer, activation_layer: L) -> Self {
+            Self {
+                fully_connected,
+                activation_layer,
+            }
+        }
+
+        fn new_simple(activation_layer: L) -> Self {
+            Self {
+                fully_connected: FullyConnectedLayer {
+                    weights: array![[1.0]],
+                    biases: array![0.0],
+                    dloss_dbiases: array![0.0],
+                    dloss_dweights: array![[0.0]],
+                },
+                activation_layer,
+            }
+        }
+    }
+
+    impl<L: Layer + Clone> Layer for FullyConnectedWithActivation<L> {
+        fn boxed_clone(&self) -> Box<dyn Layer> {
+            Box::new(self.clone())
+        }
+
+        fn forward(&self, input: &ArrayView1<f32>) -> Array1<f32> {
+            self.activation_layer
+                .forward(&self.fully_connected.forward(input).view())
+        }
+
+        fn backward(
+            &mut self,
+            input: &ArrayView1<f32>,
+            dloss_doutput: &ArrayView1<f32>,
+        ) -> Array1<f32> {
+            self.fully_connected.backward(
+                input,
+                &self.activation_layer.backward(input, dloss_doutput).view(),
+            )
+        }
+
+        fn loss(&self, output: &ArrayView1<f32>, target: &ArrayView1<f32>) -> f32 {
+            self.activation_layer.loss(output, target)
+        }
+
+        fn dloss_doutput(
+            &self,
+            output: &ArrayView1<f32>,
+            target: &ArrayView1<f32>,
+        ) -> Array1<f32> {
+            self.activation_layer.dloss_doutput(output, target)
+        }
+
+        fn update(&mut self, learning_rate: f32) {
+            self.fully_connected.update(learning_rate);
+        }
+    }
+
     #[test]
     fn test_tanh_layer_single_node() {
-        let mut layer = TanhLayer {
-            fully_connected: FullyConnected {
-                weights: array![[1.0]],
-                biases: array![0.0],
-            },
-        };
+        let mut layer = FullyConnectedWithActivation::new_simple(TanhLayer::new());
 
         let input = array![1.0];
         let output = layer.forward(&input.view());
@@ -615,7 +542,8 @@ mod tests {
         //               = (2.0 / 1) * (0.7615941559557649 - 0.0)
         assert_relative_eq!(dloss_doutput, array![1.52318831191], epsilon = 1e-10);
 
-        let dloss_dinput = layer.update(&input.view(), &dloss_doutput.view(), 0.1);
+        let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
+        layer.update(0.1);
 
         // ∂loss/∂preactivation = ∂loss/∂output * ∂output/∂preactivation
         //                      = 1.52318831191 * (1 - tanh^2(output))
@@ -644,12 +572,7 @@ mod tests {
 
     #[test]
     fn test_softmax_layer_single_node() {
-        let mut layer = SoftmaxLayer {
-            fully_connected: FullyConnected {
-                weights: array![[1.0]],
-                biases: array![0.0],
-            },
-        };
+        let mut layer = FullyConnectedWithActivation::new_simple(SoftmaxLayer::new());
 
         let input = array![1.0];
         let output = layer.forward(&input.view());
@@ -657,7 +580,8 @@ mod tests {
 
         let target = array![0.0];
         let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
-        let dloss_dinput = layer.update(&input.view(), &dloss_doutput.view(), 0.1);
+        let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
+        layer.update(0.1);
         assert_eq!(dloss_dinput, array![1.0]);
         assert_eq!(layer.fully_connected.weights, array![[0.9]]);
         assert_eq!(layer.fully_connected.biases, array![-0.1]);
@@ -665,12 +589,15 @@ mod tests {
 
     #[test]
     fn test_softmax_layer() {
-        let mut layer = SoftmaxLayer {
-            fully_connected: FullyConnected {
+        let mut layer = FullyConnectedWithActivation::new(
+            FullyConnectedLayer {
                 weights: array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
                 biases: array![1.0, 0.0],
+                dloss_dbiases: array![0.0, 0.0],
+                dloss_dweights: array![[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
             },
-        };
+            SoftmaxLayer::new(),
+        );
 
         let input = array![1.0, 2.0, 3.0];
         // 1*1 + 2*3 + 3*5 + 1 = 23
@@ -687,7 +614,8 @@ mod tests {
 
         let target = array![1.0, 0.0];
         let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
-        let dloss_dinput = layer.update(&input.view(), &dloss_doutput.view(), 0.1);
+        let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
+        layer.update(0.1);
 
         // biases -= (output - target) * leaning_rate
         // biases[0] = 1 - (0.00669285092 - 1) * 0.1 = 1.09933071491
@@ -728,8 +656,8 @@ mod tests {
 
     fn test_layer_gradient_numerically<L, M>(make_random_layer: M)
     where
-        L: LayerStatic<Gradient = FullyConnectedGradient> + LayerWeightsAndBiases,
-        M: Fn(usize, usize) -> L,
+        L: Layer + Clone,
+        M: Fn(usize, usize) -> FullyConnectedWithActivation<L>,
     {
         // We will generate a variety of random layers, compute the gradient,
         // and then numerically estimate the gradient and compare the two. If
@@ -743,7 +671,7 @@ mod tests {
         let mut tested = 0;
         let mut failures = 0;
         for _ in 0..iterations {
-            let layer = make_random_layer(input_size, output_size);
+            let mut layer = make_random_layer(input_size, output_size);
             let input = Array::random(input_size, Uniform::new(-1.0, 1.0));
             let target = Array::random(output_size, Uniform::new(0.0, 1.0));
 
@@ -751,7 +679,7 @@ mod tests {
             let loss = layer.loss(&output.view(), &target.view());
 
             let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
-            let gradient = layer.gradient(&input.view(), &dloss_doutput.view());
+            let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
 
             // We will now numerically estimate the gradient of the loss
             // function with respect to the weights. We will do this by
@@ -760,20 +688,21 @@ mod tests {
             for i in 0..input.len() {
                 for j in 0..output.len() {
                     let mut new_layer = layer.clone();
-                    new_layer.weights_mut()[[i, j]] += perturbation;
+                    new_layer.fully_connected.weights[[i, j]] += perturbation;
                     let new_output = new_layer.forward(&input.view());
                     let new_loss = new_layer.loss(&new_output.view(), &target.view());
 
                     tested += 1;
                     if !relative_eq!(
                         new_loss,
-                        loss + perturbation * gradient.dloss_dweights[[i, j]],
+                        loss + perturbation
+                            * new_layer.fully_connected.dloss_dweights[[i, j]],
                         epsilon = epsilon,
                     ) {
                         warn!(
                             "Updating weight from {} to {} updated loss from {} to {}",
-                            layer.weights()[[i, j]],
-                            new_layer.weights()[[i, j]],
+                            layer.fully_connected.weights[[i, j]],
+                            new_layer.fully_connected.weights[[i, j]],
                             loss,
                             new_loss,
                         );
@@ -788,20 +717,20 @@ mod tests {
             // element perturbed by a small amount.
             for j in 0..output.len() {
                 let mut new_layer = layer.clone();
-                new_layer.biases_mut()[j] += perturbation;
+                new_layer.fully_connected.biases[j] += perturbation;
                 let new_output = new_layer.forward(&input.view());
                 let new_loss = new_layer.loss(&new_output.view(), &target.view());
 
                 tested += 1;
                 if !relative_eq!(
                     new_loss,
-                    loss + perturbation * gradient.dloss_dbiases[j],
+                    loss + perturbation * new_layer.fully_connected.dloss_dbiases[j],
                     epsilon = epsilon,
                 ) {
                     warn!(
                         "Updating bias from {} to {} updated loss from {} to {}",
-                        layer.biases()[j],
-                        new_layer.biases()[j],
+                        layer.fully_connected.biases[j],
+                        new_layer.fully_connected.biases[j],
                         loss,
                         new_loss,
                     );
@@ -822,7 +751,7 @@ mod tests {
                 tested += 1;
                 if !relative_eq!(
                     new_loss,
-                    loss + perturbation * gradient.dloss_dinput[i],
+                    loss + perturbation * dloss_dinput[i],
                     epsilon = epsilon,
                 ) {
                     warn!(
@@ -843,21 +772,42 @@ mod tests {
     #[test]
     fn test_tanh_layer_gradient_numerically() {
         test_layer_gradient_numerically(|input_size, output_size| {
-            TanhLayer::new(input_size, output_size)
+            FullyConnectedWithActivation::new(
+                FullyConnectedLayer::new(
+                    InitializationType::Xavier,
+                    input_size,
+                    output_size,
+                ),
+                TanhLayer::new(),
+            )
         });
     }
 
     #[test]
     fn test_relu_layer_gradient_numerically() {
         test_layer_gradient_numerically(|input_size, output_size| {
-            LeakyReluLayer::new(input_size, output_size, 0.01)
+            FullyConnectedWithActivation::new(
+                FullyConnectedLayer::new(
+                    InitializationType::He,
+                    input_size,
+                    output_size,
+                ),
+                LeakyReluLayer::new(0.01),
+            )
         });
     }
 
     #[test]
     fn test_softmax_gradient_numerically() {
         test_layer_gradient_numerically(|input_size, output_size| {
-            SoftmaxLayer::new(input_size, output_size)
+            FullyConnectedWithActivation::new(
+                FullyConnectedLayer::new(
+                    InitializationType::Xavier,
+                    input_size,
+                    output_size,
+                ),
+                SoftmaxLayer::new(),
+            )
         });
     }
 }
