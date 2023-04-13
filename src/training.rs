@@ -129,6 +129,7 @@ pub fn train(
             let loss = network.loss(&outputs.view(), &targets).sum();
             if !loss.is_finite() {
                 eprintln!("Loss is not finite: {}", loss);
+                history.set_training_failure(format!("Loss is not finite: {}", loss));
                 break 'epochs;
             }
             train_loss += loss;

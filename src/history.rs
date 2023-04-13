@@ -41,6 +41,10 @@ pub struct TrainingHistory {
     /// The model with the best test accuracy.
     #[serde(skip)]
     best_model: Option<Network>,
+
+    /// If training failed, why?
+    #[serde(skip_serializing_if = "Option::is_none")]
+    training_failure: Option<String>,
 }
 
 impl TrainingHistory {
@@ -54,7 +58,13 @@ impl TrainingHistory {
             best_test_accuracy: 0.0,
             best_epoch: 0,
             best_model: None,
+            training_failure: None,
         }
+    }
+
+    /// If we failed to train, why?
+    pub fn set_training_failure<S: Into<String>>(&mut self, reason: S) {
+        self.training_failure = Some(reason.into());
     }
 
     /// Get information about each epoch.
