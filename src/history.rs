@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::layers::Network;
+use crate::network::Network;
 
 /// The results of a single epoch of training.
 pub struct EpochStats {
