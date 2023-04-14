@@ -125,7 +125,7 @@ pub trait Layer: Debug + Send + Sync + 'static {
     ) -> Array2<f32>;
 
     /// Update the weights and biases of this layer, and return `dloss_dinput`.
-    fn update(&mut self, _learning_rate: f32) {}
+    fn update_parameters(&mut self, _learning_rate: f32) {}
 }
 
 /// Fully-connected feed-forward layer without an activation function.
@@ -241,7 +241,7 @@ impl Layer for FullyConnectedLayer {
         dloss_doutput.dot(&self.weights.t())
     }
 
-    fn update(&mut self, learning_rate: f32) {
+    fn update_parameters(&mut self, learning_rate: f32) {
         self.weights = &self.weights - learning_rate * &self.dloss_dweights;
         self.biases = &self.biases - learning_rate * &self.dloss_dbiases;
     }
@@ -538,13 +538,12 @@ mod tests {
         }
 
         fn new_simple(activation_layer: L) -> Self {
+            let mut fully_connected =
+                FullyConnectedLayer::new(InitializationType::Xavier, 1, 1);
+            fully_connected.weights = array![[1.0]];
+            fully_connected.biases = array![0.0];
             Self {
-                fully_connected: FullyConnectedLayer {
-                    weights: array![[1.0]],
-                    biases: array![0.0],
-                    dloss_dbiases: array![0.0],
-                    dloss_dweights: array![[0.0]],
-                },
+                fully_connected,
                 activation_layer,
             }
         }
@@ -591,8 +590,8 @@ mod tests {
             self.activation_layer.dloss_doutput(output, target)
         }
 
-        fn update(&mut self, learning_rate: f32) {
-            self.fully_connected.update(learning_rate);
+        fn update_parameters(&mut self, learning_rate: f32) {
+            self.fully_connected.update_parameters(learning_rate);
         }
     }
 
@@ -611,7 +610,7 @@ mod tests {
         assert_relative_eq!(dloss_doutput, array![[1.52318831191]], epsilon = 1e-10);
 
         let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
-        layer.update(0.1);
+        layer.update_parameters(0.1);
 
         // ∂loss/∂preactivation = ∂loss/∂output * ∂output/∂preactivation
         //                      = 1.52318831191 * (1 - tanh^2(output))
@@ -649,7 +648,7 @@ mod tests {
         let target = array![[0.0]];
         let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
         let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
-        layer.update(0.1);
+        layer.update_parameters(0.1);
         assert_eq!(dloss_dinput, array![[1.0]]);
         assert_eq!(layer.fully_connected.weights, array![[0.9]]);
         assert_eq!(layer.fully_connected.biases, array![-0.1]);
@@ -669,15 +668,12 @@ mod tests {
 
     #[test]
     fn test_softmax_layer() {
-        let mut layer = FullyConnectedWithActivation::new(
-            FullyConnectedLayer {
-                weights: array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
-                biases: array![1.0, 0.0],
-                dloss_dbiases: array![0.0, 0.0],
-                dloss_dweights: array![[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
-            },
-            SoftmaxLayer::new(),
-        );
+        let mut fully_connected =
+            FullyConnectedLayer::new(InitializationType::Xavier, 3, 2);
+        fully_connected.weights = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        fully_connected.biases = array![1.0, 0.0];
+        let mut layer =
+            FullyConnectedWithActivation::new(fully_connected, SoftmaxLayer::new());
 
         let input = array![[1.0, 2.0, 3.0]];
         // 1*1 + 2*3 + 3*5 + 1 = 23
@@ -695,7 +691,7 @@ mod tests {
         let target = array![[1.0, 0.0]];
         let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
         let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
-        layer.update(0.1);
+        layer.update_parameters(0.1);
 
         // biases -= (output - target) * leaning_rate
         // biases[0] = 1 - (0.00669285092 - 1) * 0.1 = 1.09933071491

@@ -91,11 +91,10 @@ impl Network {
 
     /// Given an input and a target output, update the network's weights and
     /// biases, and return the loss.
-    pub fn update(
+    pub fn compute_gradients(
         &mut self,
-        input: &ArrayView2<f32>,
-        target: &ArrayView2<f32>,
-        learning_rate: f32,
+        inputs: &ArrayView2<f32>,
+        targets: &ArrayView2<f32>,
     ) {
         // Start training on all layers.
         for layer in &mut self.layers {
@@ -103,7 +102,7 @@ impl Network {
         }
 
         // Forward pass.
-        let mut inputs = vec![input.to_owned()];
+        let mut inputs = vec![inputs.to_owned()];
         for layer in &self.layers {
             inputs.push(layer.forward(&inputs.last().unwrap().view()));
         }
@@ -112,15 +111,22 @@ impl Network {
 
         // Backward pass.
         let mut dloss_doutput =
-            self.last_layer().dloss_doutput(&output.view(), &target);
+            self.last_layer().dloss_doutput(&output.view(), &targets);
         for (layer, output) in self.layers.iter_mut().zip(inputs.into_iter()).rev() {
             dloss_doutput = layer.backward(&output.view(), &dloss_doutput.view());
-            layer.update(learning_rate);
         }
 
         // End training on all layers.
         for layer in &mut self.layers {
             layer.end_training_step();
+        }
+    }
+
+    /// Update the network's weights and biases using the gradients currently stored
+    /// in the network.
+    pub fn update_parameters(&mut self, learning_rate: f32) {
+        for layer in &mut self.layers {
+            layer.update_parameters(learning_rate);
         }
     }
 }

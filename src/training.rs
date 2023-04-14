@@ -121,8 +121,11 @@ pub fn train(
                 .train_targets
                 .slice(s![batch_start..batch_end, ..]);
 
-            // Train on our batch.
-            network.update(&inputs, &targets, opt.learning_rate);
+            // Compute the gradients for our batch.
+            network.compute_gradients(&inputs, &targets);
+
+            // Now update the parameters.
+            network.update_parameters(opt.learning_rate);
 
             // Compute the loss for our batch.
             let outputs = network.forward(&inputs);
