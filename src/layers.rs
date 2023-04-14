@@ -9,7 +9,7 @@
 
 use std::fmt::Debug;
 
-use ndarray::{s, Array1, Array2, ArrayView2, Axis};
+use ndarray::{s, Array1, Array2, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis};
 use ndarray_rand::rand::seq::SliceRandom;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -46,6 +46,21 @@ pub struct LayerMetadata {
     /// Any extra metadata we want to store.
     #[serde(flatten)]
     extra: Value,
+}
+
+/// Mutable view into part of a layer's state, including both the parameters
+/// and the gradient we computed using backpropagation. This allows the
+/// optimizer to update the parameters without needing to know anything
+/// about the layer's internals.
+pub enum LayerStateMut<'a> {
+    Array1 {
+        params: ArrayViewMut1<'a, f32>,
+        grad: ArrayViewMut1<'a, f32>,
+    },
+    Array2 {
+        params: ArrayViewMut2<'a, f32>,
+        grad: ArrayViewMut2<'a, f32>,
+    },
 }
 
 /// A layer in our neural network.
@@ -123,6 +138,11 @@ pub trait Layer: Debug + Send + Sync + 'static {
         input: &ArrayView2<f32>,
         dloss_doutput: &ArrayView2<f32>,
     ) -> Array2<f32>;
+
+    /// Provide mutable access to the parameters and gradients of this layer.
+    fn layer_state_mut<'a>(&'a mut self) -> Vec<LayerStateMut<'a>> {
+        vec![]
+    }
 
     /// Update the weights and biases of this layer, and return `dloss_dinput`.
     fn update_parameters(&mut self, _learning_rate: f32) {}
@@ -239,6 +259,19 @@ impl Layer for FullyConnectedLayer {
         // ∂loss/∂input = ∂loss/∂output * ∂output/∂input
         //              = dloss_doutput * weights
         dloss_doutput.dot(&self.weights.t())
+    }
+
+    fn layer_state_mut<'a>(&'a mut self) -> Vec<LayerStateMut<'a>> {
+        vec![
+            LayerStateMut::Array1 {
+                params: self.biases.view_mut(),
+                grad: self.dloss_dbiases.view_mut(),
+            },
+            LayerStateMut::Array2 {
+                params: self.weights.view_mut(),
+                grad: self.dloss_dweights.view_mut(),
+            },
+        ]
     }
 
     fn update_parameters(&mut self, learning_rate: f32) {

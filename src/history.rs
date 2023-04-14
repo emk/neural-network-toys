@@ -1,10 +1,12 @@
 //! Training history for our neural network.
 
-use anyhow::{anyhow, Result};
+use std::fmt::Display;
+
 use serde::Serialize;
 
 use crate::{
     network::{Network, NetworkMetadata},
+    optimizers::{Optimizer, OptimizerMetadata},
     training::TrainOpt,
 };
 
@@ -15,6 +17,19 @@ pub struct EpochStats {
     pub train_accuracy: f32,
     pub test_loss: f32,
     pub test_accuracy: f32,
+}
+
+impl Display for EpochStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Train: {:.4} ({:.2}%) Test: {:.4} ({:.2}%)",
+            self.train_loss,
+            self.train_accuracy * 100.0,
+            self.test_loss,
+            self.test_accuracy * 100.0,
+        )
+    }
 }
 
 /// The history of a neural network's training.
@@ -28,6 +43,9 @@ pub struct TrainingHistory {
 
     /// Metadata about the network, including the layers.
     network: NetworkMetadata,
+
+    /// Metadata about the optimizer.
+    optimizer: OptimizerMetadata,
 
     /// History of each epoch.
     epochs: Vec<EpochStats>,
@@ -49,11 +67,17 @@ pub struct TrainingHistory {
 
 impl TrainingHistory {
     /// Create a new training history.
-    pub fn new(dataset_name: &str, opt: TrainOpt, network: &Network) -> Self {
+    pub fn new(
+        dataset_name: &str,
+        opt: TrainOpt,
+        network: &Network,
+        optimizer: &dyn Optimizer,
+    ) -> Self {
         TrainingHistory {
             dataset_name: dataset_name.to_string(),
             opt,
             network: network.metadata(),
+            optimizer: optimizer.metadata(),
             epochs: Vec::new(),
             best_test_accuracy: 0.0,
             best_epoch: 0,
@@ -67,17 +91,32 @@ impl TrainingHistory {
         self.training_failure = Some(reason.into());
     }
 
+    /// Get the name of the dataset used for training.
+    pub fn dataset_name(&self) -> &str {
+        &self.dataset_name
+    }
+
     /// Get information about each epoch.
     pub fn epochs(&self) -> &[EpochStats] {
         &self.epochs
     }
 
+    /// Metadata about the network.
+    pub fn network_metadata(&self) -> &NetworkMetadata {
+        &self.network
+    }
+
+    /// Metadata about the optimizer.
+    pub fn optimizer_metadata(&self) -> &OptimizerMetadata {
+        &self.optimizer
+    }
+
     /// The best epoch seen during training.
-    pub fn best_epoch(&self) -> Result<(usize, &EpochStats, &Network)> {
+    pub fn best_epoch(&self) -> Option<(usize, &EpochStats, &Network)> {
         if self.epochs.is_empty() || self.best_model.is_none() {
-            return Err(anyhow!("No epochs have been added to the history yet."));
+            return None;
         }
-        Ok((
+        Some((
             self.best_epoch,
             &self.epochs[self.best_epoch],
             self.best_model.as_ref().unwrap(),

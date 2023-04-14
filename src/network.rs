@@ -3,6 +3,7 @@ use serde::Serialize;
 
 use crate::layers::{
     ActivationFunction, DropoutLayer, FullyConnectedLayer, Layer, LayerMetadata,
+    LayerStateMut,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,12 +123,13 @@ impl Network {
         }
     }
 
-    /// Update the network's weights and biases using the gradients currently stored
-    /// in the network.
-    pub fn update_parameters(&mut self, learning_rate: f32) {
-        for layer in &mut self.layers {
-            layer.update_parameters(learning_rate);
-        }
+    /// The state of all the layers in our network, for use by an optimizer.
+    pub fn network_state_mut<'a>(&'a mut self) -> Vec<LayerStateMut<'a>> {
+        self.layers
+            .iter_mut()
+            .map(|l| l.layer_state_mut())
+            .flatten()
+            .collect()
     }
 }
 

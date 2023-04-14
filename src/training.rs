@@ -17,7 +17,12 @@ use crate::{
     history::{EpochStats, TrainingHistory},
     layers::ActivationFunction,
     network::Network,
+    optimizers::{
+        AdamWOptimizerBuilder, GradientDescentOptimizer, Optimizer, OptimizerType,
+    },
     plot::plot_loss,
+    signals::{initialize_signal_handlers, interrupted_by_user},
+    ui::Ui,
 };
 
 #[derive(Debug, Clone, Parser, Serialize)]
@@ -25,6 +30,10 @@ pub struct TrainOpt {
     /// Path to a JSONL file which will be used to log training history.
     #[arg(long = "history", default_value = "history.jsonl")]
     pub history_path: PathBuf,
+
+    /// The optimizer to use [adamw, gd].
+    #[arg(long = "optimizer", default_value = "adamw")]
+    pub optimizer_type: OptimizerType,
 
     // Parameters are number of epochs, the training/test split, the learning rate, and size of input (4), hidden (7) and output (3) layers.
     /// Number of epochs.
@@ -38,6 +47,14 @@ pub struct TrainOpt {
     /// Learning rate.
     #[arg(long = "learning-rate", default_value = "0.01")]
     pub learning_rate: f32,
+
+    /// L2 regularization strength.
+    #[arg(long = "l2-regularization", default_value = "0.0")]
+    pub l2_regularization: f32,
+
+    /// AdamW epsilon.
+    #[arg(long = "adamw-epsilon", default_value = "1e-8")]
+    pub adamw_epsilon: f32,
 
     /// What fraction of our hidden layers should be dropped out while training?
     /// This is a good way to reduce overfitting.
@@ -91,7 +108,26 @@ pub fn train(
     network: &mut Network,
     training_data: &TrainAndTestData,
 ) -> Result<()> {
-    let mut history = TrainingHistory::new(dataset_name, opt.clone(), network);
+    initialize_signal_handlers()?;
+
+    let mut optimizer: Box<dyn Optimizer> = match opt.optimizer_type {
+        OptimizerType::GradientDescent => {
+            Box::new(GradientDescentOptimizer::new(opt.learning_rate))
+        }
+        OptimizerType::AdamW => Box::new(
+            AdamWOptimizerBuilder::new()
+                .learning_rate(opt.learning_rate)
+                .lambda(opt.l2_regularization)
+                .epsilon(opt.adamw_epsilon)
+                .build(network),
+        ),
+    };
+
+    let mut history =
+        TrainingHistory::new(dataset_name, opt.clone(), network, optimizer.as_ref());
+    let mut ui = Ui::new()?;
+    ui.draw(&history)?;
+
     let mut rng = rand::thread_rng();
     'epochs: for epoch in 0..opt.epochs {
         debug!("Model: {:#?}", network);
@@ -124,8 +160,8 @@ pub fn train(
             // Compute the gradients for our batch.
             network.compute_gradients(&inputs, &targets);
 
-            // Now update the parameters.
-            network.update_parameters(opt.learning_rate);
+            // Now update the parameters using our optimizer.
+            optimizer.optimize(network)?;
 
             // Compute the loss for our batch.
             let outputs = network.forward(&inputs);
@@ -141,6 +177,12 @@ pub fn train(
                 if predicted_class_index(&output) == predicted_class_index(&target) {
                     train_correct += 1;
                 }
+            }
+
+            // Clean up nicely after the first Control-C.
+            if interrupted_by_user() {
+                history.set_training_failure("Interrupted by user".to_string());
+                break 'epochs;
             }
         }
         train_loss /= train_count as f32;
@@ -180,14 +222,15 @@ pub fn train(
         );
 
         // Report loss & accuracy as a percentage.
-        eprintln!(
-            "Epoch {}: train loss = {:.4} ({:.2}%), test loss = {:.4} ({:.2}%)",
-            epoch,
-            train_loss,
-            100.0 * train_accuracy,
-            test_loss,
-            100.0 * test_accuracy,
-        );
+        // eprintln!(
+        //     "Epoch {}: train loss = {:.4} ({:.2}%), test loss = {:.4} ({:.2}%)",
+        //     epoch,
+        //     train_loss,
+        //     100.0 * train_accuracy,
+        //     test_loss,
+        //     100.0 * test_accuracy,
+        // );
+        ui.draw(&history)?;
 
         // Stop training if our history shows we're not improving.
         if history.should_stop(opt.patience) {
@@ -196,16 +239,13 @@ pub fn train(
         }
     }
 
+    // Shut down the UI.
+    ui.close()?;
+
     // Report the best epoch and its stats.
-    let (best_epoch, stats, _network) = history.best_epoch()?;
-    eprintln!(
-        "Best epoch: {}: train loss = {:.4} ({:.2}%), test loss = {:.4} ({:.2}%)",
-        best_epoch,
-        stats.train_loss,
-        100.0 * stats.train_accuracy,
-        stats.test_loss,
-        100.0 * stats.test_accuracy,
-    );
+    if let Some((best_epoch, stats, _network)) = history.best_epoch() {
+        eprintln!("Best epoch: {}: {}", best_epoch, stats);
+    }
 
     // Optionally plot the training and test loss.
     if let Some(plot_path) = opt.plot {
