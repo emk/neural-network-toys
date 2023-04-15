@@ -9,12 +9,12 @@
 
 use std::fmt::Debug;
 
-use ndarray::{s, Array1, Array2, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis};
+use ndarray::{s, Array1, Array2, ArrayView2, ArrayViewMut1, Axis};
 use ndarray_rand::rand::seq::SliceRandom;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::initialization::InitializationType;
+use crate::{initialization::InitializationType, reshape::TryToShapeMut};
 
 /// The axis along which we store examples in an `Array2`.
 ///
@@ -56,15 +56,12 @@ pub struct LayerMetadata {
 /// and the gradient we computed using backpropagation. This allows the
 /// optimizer to update the parameters without needing to know anything
 /// about the layer's internals.
-pub enum LayerStateMut<'a> {
-    Array1 {
-        params: ArrayViewMut1<'a, f32>,
-        grad: ArrayViewMut1<'a, f32>,
-    },
-    Array2 {
-        params: ArrayViewMut2<'a, f32>,
-        grad: ArrayViewMut2<'a, f32>,
-    },
+///
+/// These views may have been reshaped from the original layer state
+/// in order to flatten them into consistent `ArrayViewMut1` values.
+pub struct LayerStateMut<'a> {
+    pub params: ArrayViewMut1<'a, f32>,
+    pub grad: ArrayViewMut1<'a, f32>,
 }
 
 /// A layer in our neural network.
@@ -269,13 +266,19 @@ impl Layer for FullyConnectedLayer {
 
     fn layer_state_mut<'a>(&'a mut self) -> Vec<LayerStateMut<'a>> {
         vec![
-            LayerStateMut::Array1 {
+            LayerStateMut {
                 params: self.biases.view_mut(),
                 grad: self.dloss_dbiases.view_mut(),
             },
-            LayerStateMut::Array2 {
-                params: self.weights.view_mut(),
-                grad: self.dloss_dweights.view_mut(),
+            LayerStateMut {
+                params: self
+                    .weights
+                    .try_to_shape_mut(self.weights.len())
+                    .expect("failed to reshape weights"),
+                grad: self
+                    .dloss_dweights
+                    .try_to_shape_mut(self.dloss_dweights.len())
+                    .expect("failed to reshape dloss_dweights"),
             },
         ]
     }

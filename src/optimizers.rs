@@ -3,7 +3,7 @@
 use std::{fmt::Display, str::FromStr};
 
 use anyhow::{anyhow, Result};
-use ndarray::{Array1, Array2};
+use ndarray::Array1;
 use serde::Serialize;
 use serde_json::json;
 
@@ -88,14 +88,8 @@ impl Optimizer for GradientDescentOptimizer {
 
     fn optimize(&mut self, network: &mut Network) -> Result<()> {
         for layer_state in network.network_state_mut() {
-            match layer_state {
-                LayerStateMut::Array1 { mut params, grad } => {
-                    params.assign(&(&params.view() - &(&grad * self.learning_rate)));
-                }
-                LayerStateMut::Array2 { mut params, grad } => {
-                    params.assign(&(&params.view() - &(&grad * self.learning_rate)));
-                }
-            }
+            let LayerStateMut { mut params, grad } = layer_state;
+            params.assign(&(&params.view() - &(&grad * self.learning_rate)));
         }
         Ok(())
     }
@@ -107,19 +101,11 @@ impl Optimizer for GradientDescentOptimizer {
 /// as an exponential moving average. These are the "biased" values, because
 /// they start with a value of 0.0. The variance, in particular, only updates
 /// away from 0.0 _very_ slowly.
-enum AdamWLayerState {
-    Array1 {
-        /// Point-wise momentum.
-        m: Array1<f32>,
-        /// Point-wise variance.
-        v: Array1<f32>,
-    },
-    Array2 {
-        /// Point-wise momentum.
-        m: Array2<f32>,
-        /// Point-wise variance.
-        v: Array2<f32>,
-    },
+struct AdamWLayerState {
+    /// Point-wise momentum.
+    m: Array1<f32>,
+    /// Point-wise variance.
+    v: Array1<f32>,
 }
 
 /// Build an `AdamWOptimizer`, using reasonable defaults.
@@ -241,20 +227,10 @@ impl AdamWOptimizer {
         // could add one, but that means more code.
         let mut layer_states = Vec::new();
         for layer_state in network.network_state_mut() {
-            match layer_state {
-                LayerStateMut::Array1 { params, .. } => {
-                    layer_states.push(AdamWLayerState::Array1 {
-                        m: Array1::zeros(params.raw_dim()),
-                        v: Array1::zeros(params.raw_dim()),
-                    });
-                }
-                LayerStateMut::Array2 { params, .. } => {
-                    layer_states.push(AdamWLayerState::Array2 {
-                        m: Array2::zeros(params.raw_dim()),
-                        v: Array2::zeros(params.raw_dim()),
-                    });
-                }
-            }
+            layer_states.push(AdamWLayerState {
+                m: Array1::zeros(layer_state.params.raw_dim()),
+                v: Array1::zeros(layer_state.params.raw_dim()),
+            });
         }
 
         AdamWOptimizer {
@@ -302,68 +278,29 @@ impl Optimizer for AdamWOptimizer {
             .into_iter()
             .zip(self.layer_states.iter_mut())
         {
-            // TODO: Figure out how to factor out the code duplication here. This will
-            // require writing `ndarray`-based code that's generic over the shape of
-            // the array.
-            match (layer_state, layer_state_adam) {
-                (
-                    LayerStateMut::Array1 { mut params, grad },
-                    AdamWLayerState::Array1 { m, v },
-                ) => {
-                    // Update the momentum.
-                    m.assign(
-                        &(&m.view() * self.beta1 + &grad.view() * (1.0 - self.beta1)),
-                    );
+            let LayerStateMut { mut params, grad } = layer_state;
+            let AdamWLayerState { m, v } = layer_state_adam;
 
-                    // Update the variance.
-                    v.assign(
-                        &(&v.view() * self.beta2
-                            + &(&grad.view() * &grad.view()) * (1.0 - self.beta2)),
-                    );
+            // Update the momentum.
+            m.assign(&(&m.view() * self.beta1 + &grad.view() * (1.0 - self.beta1)));
 
-                    // Correct for the initialization bias.
-                    let m_hat = &m.view() / bias_correction_1;
-                    let v_hat = &v.view() / bias_correction_2;
+            // Update the variance.
+            v.assign(
+                &(&v.view() * self.beta2
+                    + &(&grad.view() * &grad.view()) * (1.0 - self.beta2)),
+            );
 
-                    // Update the parameters.
-                    params.assign(
-                        &(&params.view()
-                            - self.learning_rate
-                                * &(&m_hat / (v_hat.mapv(f32::sqrt) + self.epsilon))
-                            - &params.view() * self.lambda),
-                    );
-                }
-                (
-                    LayerStateMut::Array2 { mut params, grad },
-                    AdamWLayerState::Array2 { m, v },
-                ) => {
-                    // Update the momentum.
-                    m.assign(
-                        &(&m.view() * self.beta1 + &grad.view() * (1.0 - self.beta1)),
-                    );
+            // Correct for the initialization bias.
+            let m_hat = &m.view() / bias_correction_1;
+            let v_hat = &v.view() / bias_correction_2;
 
-                    // Update the variance.
-                    v.assign(
-                        &(&v.view() * self.beta2
-                            + &(&grad.view() * &grad.view()) * (1.0 - self.beta2)),
-                    );
-
-                    // Correct for the initialization bias.
-                    let m_hat = &m.view() / bias_correction_1;
-                    let v_hat = &v.view() / bias_correction_2;
-
-                    // Update the parameters.
-                    params.assign(
-                        &(&params.view()
-                            - self.learning_rate
-                                * &(&m_hat / (v_hat.mapv(f32::sqrt) + self.epsilon))
-                            - &params.view() * self.lambda),
-                    );
-                }
-                _ => {
-                    return Err(anyhow!("Invalid layer state shapes"));
-                }
-            }
+            // Update the parameters.
+            params.assign(
+                &(&params.view()
+                    - self.learning_rate
+                        * &(&m_hat / (v_hat.mapv(f32::sqrt) + self.epsilon))
+                    - &params.view() * self.lambda),
+            );
         }
         Ok(())
     }

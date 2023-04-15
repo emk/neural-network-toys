@@ -28,6 +28,7 @@ mod layers;
 mod network;
 mod optimizers;
 mod plot;
+mod reshape;
 mod signals;
 mod training;
 mod ui;
