@@ -34,6 +34,10 @@ pub struct LayerMetadata {
     #[serde(rename = "type")]
     pub layer_type: String,
 
+    /// A short summary of this layer, if it's interesting enough to
+    /// include in an abbreviated summary of the network.
+    pub short_summary: String,
+
     /// The number of inputs to this layer.
     pub inputs: usize,
 
@@ -80,6 +84,7 @@ pub trait Layer: Debug + Send + Sync + 'static {
         // By default, assume layers have the same number of inputs and outputs.
         LayerMetadata {
             layer_type: self.layer_type().to_owned(),
+            short_summary: self.layer_type().to_owned(),
             inputs,
             outputs: inputs,
             parameters: 0,
@@ -201,6 +206,7 @@ impl Layer for FullyConnectedLayer {
         //assert_eq!(inputs, self.weights.len_of(Axis(0)));
         LayerMetadata {
             layer_type: self.layer_type().to_owned(),
+            short_summary: format!("⤨ {}", self.weights.len_of(Axis(1))),
             inputs,
             outputs: self.weights.len_of(Axis(1)),
             parameters: self.weights.len() + self.biases.len(),
@@ -343,6 +349,7 @@ impl Layer for LeakyReluLayer {
     fn metadata(&self, inputs: usize) -> LayerMetadata {
         LayerMetadata {
             layer_type: self.layer_type().to_owned(),
+            short_summary: "lrelu".to_owned(),
             inputs,
             outputs: inputs,
             parameters: 0,
@@ -468,6 +475,7 @@ impl Layer for DropoutLayer {
     fn metadata(&self, inputs: usize) -> LayerMetadata {
         LayerMetadata {
             layer_type: self.layer_type().to_owned(),
+            short_summary: "💧".to_owned(),
             inputs,
             outputs: inputs,
             parameters: 0,

@@ -3,6 +3,7 @@
 use std::io;
 
 use anyhow::Result;
+use human_format::Formatter;
 use tui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -56,7 +57,7 @@ impl Ui {
                 .direction(Direction::Vertical)
                 .margin(1)
                 .constraints([
-                    Constraint::Length(2),
+                    Constraint::Length(3),
                     // This should take up 2/5ths of the screen.
                     Constraint::Ratio(2, 5),
                     Constraint::Min(1),
@@ -74,16 +75,32 @@ impl Ui {
     /// Draw the header.
     fn draw_header(f: &mut Frame, area: Rect, history: &TrainingHistory) {
         let style = Style::default().fg(Color::Yellow);
+        let mut formatter = Formatter::new();
+        formatter.with_separator("");
+
         let mut text = vec![Spans::from(vec![Span::styled(
             format!(
-                "{} {} layers={}",
+                "{} {} layers={} params={}",
                 history.dataset_name(),
                 history.optimizer_metadata().optimizer_type,
                 history.network_metadata().layers.len(),
+                formatter.format(history.network_metadata().parameters() as f64),
             ),
             style,
         )])];
 
+        // Summarize the geometry of the network.
+        let mut network_summary_spans = vec![Span::styled(
+            format!("{}", history.network_metadata().input_width,),
+            style,
+        )];
+        for layer in history.network_metadata().layers.iter() {
+            network_summary_spans
+                .push(Span::styled(format!(" {}", layer.short_summary), style));
+        }
+        text.push(Spans::from(network_summary_spans));
+
+        // Show the best epoch.
         if let Some((epoch, stats, _)) = history.best_epoch() {
             text.push(Spans::from(vec![Span::styled(
                 // Show loss and accuracy for training and test data.

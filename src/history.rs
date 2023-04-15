@@ -23,7 +23,7 @@ impl Display for EpochStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Train: {:.4} ({:.2}%) Test: {:.4} ({:.2}%)",
+            "train {:.4} ({:.2}%) test {:.4} ({:.2}%)",
             self.train_loss,
             self.train_accuracy * 100.0,
             self.test_loss,

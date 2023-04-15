@@ -13,6 +13,7 @@ clap = { version = "4.2.1", features = ["derive", "wrap_help"] }
 csv = "1.2.1"
 ctrlc = "3.2.5"
 env_logger = "0.10.0"
+human_format = "1.0.3"
 log = "0.4.17"
 mnist = { version = "0.5.0", features = ["download"] }
 ndarray = { version = "0.15.6", features = ["approx-0_5", "rayon", "serde"] }

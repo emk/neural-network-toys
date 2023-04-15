@@ -8,13 +8,23 @@ use crate::layers::{
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NetworkMetadata {
+    pub input_width: usize,
+    pub output_width: usize,
     pub layers: Vec<LayerMetadata>,
+}
+
+impl NetworkMetadata {
+    /// The total number of parameters in the network.
+    pub fn parameters(&self) -> usize {
+        self.layers.iter().map(|layer| layer.parameters).sum()
+    }
 }
 
 /// A neural network.
 #[derive(Debug)]
 pub struct Network {
-    next_input_width: usize,
+    input_width: usize,
+    current_output_width: usize,
     layers: Vec<Box<dyn Layer>>,
 }
 
@@ -22,7 +32,8 @@ impl Network {
     /// Create a new network with the specified number of inputs.
     pub fn new(input_width: usize) -> Self {
         Self {
-            next_input_width: input_width,
+            input_width,
+            current_output_width: input_width,
             layers: vec![],
         }
     }
@@ -30,7 +41,7 @@ impl Network {
     /// Metadata about the network.
     pub fn metadata(&self) -> NetworkMetadata {
         let mut layers = vec![];
-        let mut input_width = self.next_input_width;
+        let mut input_width = self.input_width;
 
         for layer in &self.layers {
             let metadata = layer.metadata(input_width);
@@ -38,7 +49,11 @@ impl Network {
             layers.push(metadata);
         }
 
-        NetworkMetadata { layers }
+        NetworkMetadata {
+            input_width: self.input_width,
+            output_width: self.current_output_width,
+            layers,
+        }
     }
 
     /// Add a fully connected layer, with the given number of inputs and outputs
@@ -52,10 +67,10 @@ impl Network {
             activation_function.input_weight_inititialization_type();
         let fully_connected = FullyConnectedLayer::new(
             input_weight_initialization_type,
-            self.next_input_width,
+            self.current_output_width,
             output_width,
         );
-        self.next_input_width = output_width;
+        self.current_output_width = output_width;
         self.layers.push(Box::new(fully_connected));
         self.layers.push(activation_function.layer());
     }
@@ -63,7 +78,7 @@ impl Network {
     /// Add a dropout layer, with the given keep probability. This is only used
     /// during training.
     pub fn add_dropout_layer(&mut self, keep_probability: f32) {
-        let dropout = DropoutLayer::new(self.next_input_width, keep_probability);
+        let dropout = DropoutLayer::new(self.current_output_width, keep_probability);
         self.layers.push(Box::new(dropout));
     }
 
@@ -136,7 +151,8 @@ impl Network {
 impl Clone for Network {
     fn clone(&self) -> Self {
         Self {
-            next_input_width: self.next_input_width,
+            input_width: self.input_width,
+            current_output_width: self.current_output_width,
             layers: self.layers.iter().map(|l| l.boxed_clone()).collect(),
         }
     }
