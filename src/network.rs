@@ -1,9 +1,10 @@
+use anyhow::Result;
 use ndarray::{Array1, Array2, ArrayView2};
 use serde::Serialize;
 
 use crate::layers::{
-    ActivationFunction, DropoutLayer, FullyConnectedLayer, Layer, LayerMetadata,
-    LayerStateMut,
+    ActivationFunction, ConvLayer, DropoutLayer, FullyConnectedLayer, Layer,
+    LayerMetadata, LayerStateMut, PoolLayer,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +55,46 @@ impl Network {
             output_width: self.current_output_width,
             layers,
         }
+    }
+
+    /// Add a convolutional layer.
+    pub fn add_conv_layer(
+        &mut self,
+        height: usize,
+        width: usize,
+        channels_in: usize,
+        channels_out: usize,
+        kernel_size: usize,
+        activation_function: ActivationFunction,
+    ) -> Result<()> {
+        let input_weight_initialization_type =
+            activation_function.input_weight_inititialization_type();
+        let conv = ConvLayer::new(
+            input_weight_initialization_type,
+            height,
+            width,
+            channels_in,
+            channels_out,
+            kernel_size,
+        )?;
+        self.current_output_width = channels_out;
+        self.layers.push(Box::new(conv));
+        self.layers.push(activation_function.layer());
+        Ok(())
+    }
+
+    /// Add a max pooling layer.
+    pub fn add_pool_layer(
+        &mut self,
+        height: usize,
+        width: usize,
+        channels: usize,
+        kernel_size: usize,
+        stride: usize,
+    ) {
+        let pool = PoolLayer::new(height, width, channels, kernel_size, stride);
+        self.current_output_width = pool.outputs();
+        self.layers.push(Box::new(pool));
     }
 
     /// Add a fully connected layer, with the given number of inputs and outputs

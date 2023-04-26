@@ -1,4 +1,6 @@
 {
     "editor.formatOnSave": true,
-    "rust-analyzer.showUnlinkedFileNotification": false
+    "rust-analyzer.showUnlinkedFileNotification": false,
+    "python.formatting.provider": "black",
+    "python.defaultInterpreterPath": "python3.10"
 }

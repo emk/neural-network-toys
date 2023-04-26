@@ -3,3 +3,13 @@
 /loss.svg
 /data/mnist/
 /history.jsonl
+/perf.data
+/perf.data.old
+/flamegraph.svg
+/math/.ipynb_checkpoints/
+*.aux
+*.fls
+*.log
+*.synctex.gz
+*.fdb_latexmk
+*.pdf

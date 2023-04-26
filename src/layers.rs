@@ -1,20 +1,20 @@
-// TASK: We are converting this file from Stochastic Gradient Descent to
-// mini-batch gradient descent. To do this, we need to take many APIs
-// that previously took an `Array1` or an `ArrayView1` and change them
-// to take an `ArrayView2` or an `Array2`.  Our arrays will be stored
-// `(examples, features)` instead of `(features,)`.
 //
-// We will work through the file from the top down, converting each API
-// as we go.
 
-use std::fmt::Debug;
+use std::{cell::RefCell, fmt::Debug};
 
-use ndarray::{s, Array1, Array2, ArrayView2, ArrayViewMut1, Axis};
+use anyhow::{anyhow, Result};
+use ndarray::{
+    s, Array1, Array2, Array4, ArrayView2, ArrayView4, ArrayViewMut1, Axis,
+};
 use ndarray_rand::rand::seq::SliceRandom;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::{initialization::InitializationType, reshape::TryToShapeMut};
+use crate::{
+    im2col::{Im2ColConv, Im2ColDLossDImg},
+    initialization::InitializationType,
+    reshape::TryToShapeMut,
+};
 
 /// The axis along which we store examples in an `Array2`.
 ///
@@ -68,7 +68,7 @@ pub struct LayerStateMut<'a> {
 ///
 /// This is designed to support mini-batch gradient descent, so all
 /// functions take and return arrays with shape `(examples, features)`.
-pub trait Layer: Debug + Send + Sync + 'static {
+pub trait Layer: Debug + 'static {
     /// Return a boxed clone of this layer.
     fn boxed_clone(&self) -> Box<dyn Layer>;
 
@@ -103,9 +103,7 @@ pub trait Layer: Debug + Send + Sync + 'static {
         // For each output, we want to compute:
         //
         // loss = 1/n * (output - target)^2
-        let diff = output - target;
-
-        // We want to compute the mean of each row, so we need to sum each row.
+        let diff = (output - target).mapv(|x| x * x);
         diff.sum_axis(ARRAY2_FEATURES_AXIS)
             / (output.len_of(ARRAY2_FEATURES_AXIS) as f32)
     }
@@ -222,9 +220,7 @@ impl Layer for FullyConnectedLayer {
     ) -> Array2<f32> {
         // ∂loss/∂biases = ∂loss/∂output * ∂output/∂biases
         //               = dloss_doutput * 1
-        self.dloss_dbiases = dloss_doutput
-            .mean_axis(ARRAY2_EXAMPLES_AXIS)
-            .expect("batch size > 0");
+        self.dloss_dbiases = dloss_doutput.sum_axis(ARRAY2_EXAMPLES_AXIS);
 
         // ∂loss/∂weights = ∂loss/∂output * ∂output/∂weights
         //                = ∂loss_doutput * input
@@ -255,9 +251,8 @@ impl Layer for FullyConnectedLayer {
         //
         // And we want to compute:
         //
-        // dloss_dweights_{i,o} = input_{b,i} * dloss_doutput_{b,o} / batch_size
-        self.dloss_dweights = input.t().dot(dloss_doutput)
-            / dloss_doutput.len_of(ARRAY2_EXAMPLES_AXIS) as f32;
+        // dloss_dweights_{i,o} = input_{b,i} * dloss_doutput_{b,o}
+        self.dloss_dweights = input.t().dot(dloss_doutput);
 
         // ∂loss/∂input = ∂loss/∂output * ∂output/∂input
         //              = dloss_doutput * weights
@@ -286,6 +281,561 @@ impl Layer for FullyConnectedLayer {
     fn update_parameters(&mut self, learning_rate: f32) {
         self.weights = &self.weights - learning_rate * &self.dloss_dweights;
         self.biases = &self.biases - learning_rate * &self.dloss_dbiases;
+    }
+}
+
+/// A convolutional layer with the specified number of filters.
+///
+/// Conceptually:
+///
+/// - The input is a 4D array of shape `(batch_size, channels_in, height, width)`.
+/// - The output is a 4D array of shape `(batch_size, channels_out, height, width)`.
+///
+/// In our input layer, our channels might represent RGB values, so we have
+/// `[red, green, blue]` for each pixel. In our output layer, our channels
+/// represent the output of a learned convolutional filter. They might represent
+/// `[edges, corners, blobs]` for each pixel (but the actual output channels
+/// will be learned by backpropagation). If we go one layer deeper, our input
+/// channels might represent `[edges, corners, blobs]` for each pixel, and our
+/// output channels might represent increasingly abstract features, like `[eyes,
+/// noses, mouths]`.
+#[derive(Debug, Clone)]
+pub struct ConvLayer {
+    /// The height of the images in our input.
+    height: usize,
+
+    /// The width of the images in our input.
+    width: usize,
+
+    /// The number of input channels.
+    channels_in: usize,
+
+    /// The number of output channels.
+    channels_out: usize,
+
+    /// The width and height of the kernel.
+    kernel_size: usize,
+
+    /// The amount of padding to place around the input.
+    padding: usize,
+
+    /// Our input, padded with zeros so that we can apply the kernel to the
+    /// edges of the image without needing to do bounds checking.
+    ///
+    /// We use a `RefCell` here because the mutability of this field is an
+    /// optimization, not part of our public API. We could instead make
+    /// `forward` take a `&mut self` and avoid the `RefCell`.
+    ///
+    /// Shape: (batch_size, channels_in, height + 2 * padding, width + 2 *
+    /// padding)
+    padded_input: RefCell<Option<Array4<f32>>>,
+
+    /// The weights of the filters.
+    ///
+    /// Shape: (channels_out, channels_in, kernel_size, kernel_size)
+    weights: Array4<f32>,
+
+    /// The biases for each output channel.
+    ///
+    /// Shape: (channels_out,)
+    biases: Array1<f32>,
+
+    /// ∂loss/∂weights averaged over the batch.
+    ///
+    /// Shape: (channels_out, channels_in, kernel_size, kernel_size)
+    dloss_dweights: Array4<f32>,
+
+    /// ∂loss/∂biases averaged over the batch.
+    ///
+    /// Shape: (chusizeannels_out,)
+    dloss_dbiases: Array1<f32>,
+}
+
+impl ConvLayer {
+    /// Initialize `ConvLayer`.
+    pub fn new(
+        initialization_type: InitializationType,
+        height: usize,
+        width: usize,
+        channels_in: usize,
+        channels_out: usize,
+        kernel_size: usize,
+    ) -> Result<Self> {
+        if kernel_size > 0 && kernel_size % 2 == 0 {
+            return Err(anyhow!("kernel_size must be odd"));
+        }
+
+        let weights = initialization_type
+            .weights(channels_out, channels_in * kernel_size * kernel_size);
+        let dloss_dweights =
+            Array4::zeros((channels_out, channels_in, kernel_size, kernel_size));
+        Ok(Self {
+            height,
+            width,
+            channels_in,
+            channels_out,
+            kernel_size,
+            padding: (kernel_size - 1) / 2,
+            padded_input: RefCell::new(None),
+            weights: weights
+                .into_shape((channels_out, channels_in, kernel_size, kernel_size))
+                .expect("failed to reshape weights"),
+            biases: Array1::zeros(channels_out),
+            dloss_dweights,
+            dloss_dbiases: Array1::zeros(channels_out),
+        })
+    }
+
+    /// Copy `input` into `self.padded_input`, making sure that it's the right
+    /// shape and that the padding is set to 0. We try to minimize
+    /// reallocations.
+    fn set_padded_input(&self, input: &ArrayView4<f32>) {
+        let padded_shape = [
+            input.len_of(Axis(0)),
+            input.len_of(Axis(1)),
+            input.len_of(Axis(2)) + 2 * self.padding,
+            input.len_of(Axis(3)) + 2 * self.padding,
+        ];
+        if self.padded_input.borrow().is_none()
+            || self.padded_input.borrow().as_ref().unwrap().shape() != &padded_shape
+        {
+            *self.padded_input.borrow_mut() = Some(Array4::zeros(padded_shape));
+        }
+        self.padded_input
+            .borrow_mut()
+            .as_mut()
+            .expect("failed to get padded_input")
+            .slice_mut(s![
+                ..,
+                ..,
+                self.padding..self.padding + input.len_of(Axis(2)),
+                self.padding..self.padding + input.len_of(Axis(3)),
+            ])
+            .assign(&input);
+    }
+}
+
+impl Layer for ConvLayer {
+    fn boxed_clone(&self) -> Box<dyn Layer> {
+        Box::new(self.clone())
+    }
+
+    fn layer_type(&self) -> &'static str {
+        "conv"
+    }
+
+    fn metadata(&self, inputs: usize) -> LayerMetadata {
+        //assert_eq!(inputs, self.weights.len_of(Axis(0)));
+        LayerMetadata {
+            layer_type: self.layer_type().to_owned(),
+            short_summary: format!(
+                "⧆ {}→ {}×{}²",
+                self.channels_in, self.channels_out, self.kernel_size,
+            ),
+            inputs,
+            outputs: self.channels_out * self.height * self.width,
+            parameters: self.weights.len() + self.biases.len(),
+            extra: json!({
+                "height": self.height,
+                "kernel_size": self.kernel_size,
+                "channels_in": self.channels_in,
+                "channels_out": self.channels_out,
+                "width": self.width,
+            }),
+        }
+    }
+
+    fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
+        // Number of examples we're processing.
+        let example_count = input.len_of(ARRAY2_EXAMPLES_AXIS);
+
+        // We'll use our `Iml2ColConv` to perform an efficient convolution.
+        let mut iml2col = Im2ColConv::new(
+            (self.channels_in, self.height, self.width),
+            (
+                self.channels_out,
+                self.channels_in,
+                self.kernel_size,
+                self.kernel_size,
+            ),
+        );
+
+        // Reshape biases so we can add them to the output easily.
+        let biases = self
+            .biases
+            .to_shape((self.channels_out, 1, 1))
+            .expect("reshape biases");
+        let biases = biases
+            .broadcast((self.channels_out, self.height, self.width))
+            .expect("broadcast biases");
+
+        // Convolve each example.
+        //
+        // TODO: This has high memory overhead. We might want to convolve
+        // several examples at once, but not all of them.
+        let mut result = Array2::zeros((
+            example_count,
+            self.channels_out * self.height * self.width,
+        ));
+        for i in 0..example_count {
+            let img = input
+                .slice(s![i, ..])
+                .into_shape((self.channels_in, self.height, self.width))
+                .expect("failed to reshape input");
+            let mut out = result
+                .slice_mut(s![i, ..])
+                .into_shape((self.channels_out, self.height, self.width))
+                .expect("failed to reshape output");
+            iml2col.conv2d(img, self.weights.view(), &mut out);
+            out += &biases;
+        }
+        result
+    }
+
+    fn backward(
+        &mut self,
+        input: &ArrayView2<f32>,
+        dloss_doutput: &ArrayView2<f32>,
+    ) -> Array2<f32> {
+        // Number of examples we're processing.
+        let example_count = input.len_of(ARRAY2_EXAMPLES_AXIS);
+
+        // We need to reshape the input to a 4D array.
+        let input = input
+            .into_shape((example_count, self.channels_in, self.height, self.width))
+            .expect("failed to reshape input");
+        self.set_padded_input(&input.view());
+        let padded_input = self.padded_input.borrow();
+        let padded_input = padded_input.as_ref().expect("padded_input not set");
+
+        // We need to reshape the output gradient to a 4D array.
+        let dloss_doutput = dloss_doutput
+            .into_shape((example_count, self.channels_out, self.height, self.width))
+            .expect("failed to reshape output gradient");
+
+        // We need to compute:
+        // - ∂loss/∂weights
+        // - ∂loss/∂biases
+        // - ∂loss/∂input
+
+        // ∂loss/∂weights = ∂loss/∂output * ∂output/∂weights
+        //                = ∂loss/∂output * input
+        self.dloss_dweights = Array4::zeros(self.weights.dim());
+        for example in 0..example_count {
+            for channel_out in 0..self.channels_out {
+                for row in 0..self.height {
+                    for col in 0..self.width {
+                        for channel_in in 0..self.channels_in {
+                            for kernel_row in 0..self.kernel_size {
+                                for kernel_col in 0..self.kernel_size {
+                                    let input_row = row + kernel_row;
+                                    let input_col = col + kernel_col;
+                                    self.dloss_dweights[[
+                                        channel_out,
+                                        channel_in,
+                                        kernel_row,
+                                        kernel_col,
+                                    ]] += padded_input
+                                        [[example, channel_in, input_row, input_col]]
+                                        * dloss_doutput
+                                            [[example, channel_out, row, col]];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ∂loss/∂biases = ∂loss/∂output * ∂output/∂biases
+        //               = ∂loss/∂output * 1
+        self.dloss_dbiases = Array1::zeros(self.biases.dim());
+        for example in 0..example_count {
+            for channel_out in 0..self.channels_out {
+                for row in 0..self.height {
+                    for col in 0..self.width {
+                        self.dloss_dbiases[[channel_out]] +=
+                            dloss_doutput[[example, channel_out, row, col]];
+                    }
+                }
+            }
+        }
+
+        // ∂loss/∂input = ∂loss/∂output * ∂output/∂input
+        //              = ∂loss/∂output * weights
+        //
+        // We have an efficient implementation of this in `Im2ColDLossDImg`.
+        let mut iml2col = Im2ColDLossDImg::new(
+            (self.channels_in, self.height, self.width),
+            (
+                self.channels_out,
+                self.channels_in,
+                self.kernel_size,
+                self.kernel_size,
+            ),
+        );
+        let mut result = Array2::zeros((
+            example_count,
+            self.channels_in * self.height * self.width,
+        ));
+        for i in 0..example_count {
+            let mut dloss_dinput = result
+                .slice_mut(s![i, ..])
+                .into_shape((self.channels_in, self.height, self.width))
+                .expect("failed to reshape output");
+            let dloss_doutput = dloss_doutput.slice(s![i, .., .., ..]);
+            iml2col.dloss_dimg(
+                dloss_doutput.view(),
+                self.weights.view(),
+                &mut dloss_dinput,
+            );
+        }
+        result
+    }
+}
+
+/// A pooling layer.
+#[derive(Debug, Clone)]
+pub struct PoolLayer {
+    /// The height of the images in our input.
+    height: usize,
+
+    /// The width of the images in our input.
+    width: usize,
+
+    /// The height of the images in our output.
+    out_height: usize,
+
+    /// The width of the images in our output.
+    out_width: usize,
+
+    /// The number of input channels.
+    channels: usize,
+
+    /// The size of the pooling kernel.
+    kernel_size: usize,
+
+    /// The stride of the pooling kernel.
+    stride: usize,
+
+    /// Our input, padded along the right and bottom edges.
+    padded_input: RefCell<Option<Array4<f32>>>,
+}
+
+impl PoolLayer {
+    /// Initialize `PoolLayer`.
+    pub fn new(
+        height: usize,
+        width: usize,
+        channels: usize,
+        kernel_size: usize,
+        stride: usize,
+    ) -> Self {
+        let out_height = (height + stride - 1) / stride;
+        let out_width = (width + stride - 1) / stride;
+
+        Self {
+            height,
+            width,
+            out_height,
+            out_width,
+            channels,
+            kernel_size,
+            stride,
+            padded_input: RefCell::new(None),
+        }
+    }
+
+    /// Output height.
+    pub fn out_height(&self) -> usize {
+        self.out_height
+    }
+
+    /// Output width.
+    pub fn out_width(&self) -> usize {
+        self.out_width
+    }
+
+    /// Number of total (flattened) outputs produced by this layer.
+    pub fn outputs(&self) -> usize {
+        self.channels * self.out_height * self.out_width
+    }
+
+    /// Set the padded input.
+    fn set_padded_input(&self, input: &ArrayView4<f32>) {
+        // Use stride and kernel size to compute the padding we need to add to
+        // the right and bottom edges of the input.
+        let in_height = (self.out_height - 1) * self.stride + self.kernel_size;
+        let in_width = (self.out_width - 1) * self.stride + self.kernel_size;
+        assert!(
+            in_height >= self.height && in_height < self.height + self.kernel_size
+        );
+        assert!(in_width >= self.width && in_width < self.width + self.kernel_size);
+
+        // Compute our padded shape.
+        let padded_shape = [
+            input.len_of(Axis(0)),
+            input.len_of(Axis(1)),
+            in_height,
+            in_width,
+        ];
+
+        // Make sure self.padded_input is the right shape.
+        if self.padded_input.borrow().is_none()
+            || self.padded_input.borrow().as_ref().unwrap().shape() != padded_shape
+        {
+            // Fill with negative infinity.
+            *self.padded_input.borrow_mut() =
+                Some(Array4::from_elem(padded_shape, f32::NEG_INFINITY));
+        }
+
+        // Copy the input into the padded input.
+        let mut padded_input = self.padded_input.borrow_mut();
+        padded_input
+            .as_mut()
+            .expect("padded_input should be Some")
+            .slice_mut(s![.., .., ..self.height, ..self.width])
+            .assign(input);
+    }
+}
+
+impl Layer for PoolLayer {
+    fn boxed_clone(&self) -> Box<dyn Layer> {
+        Box::new(self.clone())
+    }
+
+    fn layer_type(&self) -> &'static str {
+        "pool"
+    }
+
+    fn metadata(&self, inputs: usize) -> LayerMetadata {
+        LayerMetadata {
+            layer_type: self.layer_type().to_owned(),
+            short_summary: format!("pool/{}", self.stride),
+            inputs,
+            outputs: self.channels * self.out_height * self.out_width,
+            parameters: 0,
+            extra: json!({
+                "height": self.height,
+                "width": self.width,
+                "channels": self.channels,
+                "kernel_size": self.kernel_size,
+                "stride": self.stride,
+            }),
+        }
+    }
+
+    fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
+        // Reshape the input into a 4D array.
+        let input = input
+            .into_shape((
+                input.len_of(ARRAY2_EXAMPLES_AXIS),
+                self.channels,
+                self.height,
+                self.width,
+            ))
+            .expect("failed to reshape input");
+        self.set_padded_input(&input);
+        let padded_input = self.padded_input.borrow();
+        let padded_input = padded_input.as_ref().expect("padded_input should be Some");
+
+        // Compute the output.
+        let mut output = Array2::zeros((
+            input.len_of(ARRAY2_EXAMPLES_AXIS),
+            self.channels * self.out_height * self.out_width,
+        ));
+        for example in 0..input.len_of(ARRAY2_EXAMPLES_AXIS) {
+            for channel in 0..self.channels {
+                for row in 0..self.out_height {
+                    for col in 0..self.out_width {
+                        let mut max = f32::NEG_INFINITY;
+                        for kernel_row in 0..self.kernel_size {
+                            for kernel_col in 0..self.kernel_size {
+                                let input_row = row * self.stride + kernel_row;
+                                let input_col = col * self.stride + kernel_col;
+                                let value = padded_input
+                                    [[example, channel, input_row, input_col]];
+                                if value > max {
+                                    max = value;
+                                }
+                            }
+                        }
+                        output[[
+                            example,
+                            channel * self.out_height * self.out_width
+                                + row * self.out_width
+                                + col,
+                        ]] = max;
+                    }
+                }
+            }
+        }
+        output
+    }
+
+    fn backward(
+        &mut self,
+        input: &ArrayView2<f32>,
+        dloss_doutput: &ArrayView2<f32>,
+    ) -> Array2<f32> {
+        // Reshape the input into a 4D array.
+        let input = input
+            .into_shape((
+                input.len_of(ARRAY2_EXAMPLES_AXIS),
+                self.channels,
+                self.height,
+                self.width,
+            ))
+            .expect("failed to reshape input");
+        self.set_padded_input(&input);
+        let padded_input = self.padded_input.borrow();
+        let padded_input = padded_input.as_ref().expect("padded_input should be Some");
+
+        // Compute the output.
+        let mut dloss_dinput = Array4::zeros((
+            input.len_of(ARRAY2_EXAMPLES_AXIS),
+            self.channels,
+            self.height,
+            self.width,
+        ));
+        for example in 0..input.len_of(ARRAY2_EXAMPLES_AXIS) {
+            for channel in 0..self.channels {
+                for row in 0..self.out_height {
+                    for col in 0..self.out_width {
+                        let mut max = f32::NEG_INFINITY;
+                        let mut max_row = 0;
+                        let mut max_col = 0;
+                        for kernel_row in 0..self.kernel_size {
+                            for kernel_col in 0..self.kernel_size {
+                                let input_row = row * self.stride + kernel_row;
+                                let input_col = col * self.stride + kernel_col;
+                                let value = padded_input
+                                    [[example, channel, input_row, input_col]];
+                                if value > max {
+                                    max = value;
+                                    max_row = input_row;
+                                    max_col = input_col;
+                                }
+                            }
+                        }
+                        dloss_dinput[[example, channel, max_row, max_col]] +=
+                            dloss_doutput[[
+                                example,
+                                channel * self.out_height * self.out_width
+                                    + row * self.out_width
+                                    + col,
+                            ]];
+                    }
+                }
+            }
+        }
+
+        dloss_dinput
+            .into_shape((
+                input.len_of(ARRAY2_EXAMPLES_AXIS),
+                self.channels * self.height * self.width,
+            ))
+            .expect("failed to reshape dloss_dinput")
     }
 }
 
@@ -558,380 +1108,285 @@ impl ActivationFunction {
 
 #[cfg(test)]
 mod tests {
-    use approx::{assert_relative_eq, relative_eq};
-    use log::warn;
-    use ndarray::{array, Array};
-    use ndarray_rand::{rand_distr::Uniform, RandomExt};
+    use approx::assert_relative_eq;
+    use serde::Deserialize;
 
     use super::*;
+    use crate::{
+        im2col::tests::load_conv2d_fixture,
+        test_utils::{deserialize_array1, deserialize_array2, deserialize_array4},
+    };
 
-    /// Backwards compatibility for tests that were written before we had
-    /// separate layers for fully connected layers and activation layers.
-    #[derive(Clone, Debug)]
-    struct FullyConnectedWithActivation<L: Layer + Clone> {
-        fully_connected: FullyConnectedLayer,
-        activation_layer: L,
+    #[derive(Debug, Deserialize)]
+    struct ActivationGradients {
+        #[serde(deserialize_with = "deserialize_array2")]
+        inputs: Array2<f32>,
     }
 
-    impl<L: Layer + Clone> FullyConnectedWithActivation<L> {
-        fn new(fully_connected: FullyConnectedLayer, activation_layer: L) -> Self {
-            Self {
-                fully_connected,
-                activation_layer,
-            }
-        }
-
-        fn new_simple(activation_layer: L) -> Self {
-            let mut fully_connected =
-                FullyConnectedLayer::new(InitializationType::Xavier, 1, 1);
-            fully_connected.weights = array![[1.0]];
-            fully_connected.biases = array![0.0];
-            Self {
-                fully_connected,
-                activation_layer,
-            }
-        }
+    #[derive(Debug, Deserialize)]
+    struct ActivationFixture {
+        #[serde(deserialize_with = "deserialize_array2")]
+        inputs: Array2<f32>,
+        #[serde(deserialize_with = "deserialize_array2")]
+        outputs: Array2<f32>,
+        #[serde(deserialize_with = "deserialize_array2")]
+        targets: Array2<f32>,
+        gradients: ActivationGradients,
     }
 
-    impl<L: Layer + Clone> Layer for FullyConnectedWithActivation<L> {
-        fn boxed_clone(&self) -> Box<dyn Layer> {
-            Box::new(self.clone())
-        }
+    fn assert_activation_layer_matches_fixture(layer: &mut dyn Layer, json: &str) {
+        let fixture: ActivationFixture = serde_json::from_str(json).unwrap();
+        let outputs = layer.forward(&fixture.inputs.view());
+        assert_relative_eq!(outputs, fixture.outputs);
 
-        fn layer_type(&self) -> &'static str {
-            "test_layer"
-        }
-
-        fn forward(&self, input: &ArrayView2<f32>) -> Array2<f32> {
-            self.activation_layer
-                .forward(&self.fully_connected.forward(input).view())
-        }
-
-        fn backward(
-            &mut self,
-            input: &ArrayView2<f32>,
-            dloss_doutput: &ArrayView2<f32>,
-        ) -> Array2<f32> {
-            self.fully_connected.backward(
-                input,
-                &self.activation_layer.backward(input, dloss_doutput).view(),
-            )
-        }
-
-        fn loss(
-            &self,
-            output: &ArrayView2<f32>,
-            target: &ArrayView2<f32>,
-        ) -> Array1<f32> {
-            self.activation_layer.loss(output, target)
-        }
-
-        fn dloss_doutput(
-            &self,
-            output: &ArrayView2<f32>,
-            target: &ArrayView2<f32>,
-        ) -> Array2<f32> {
-            self.activation_layer.dloss_doutput(output, target)
-        }
-
-        fn update_parameters(&mut self, learning_rate: f32) {
-            self.fully_connected.update_parameters(learning_rate);
-        }
+        let dloss_doutputs =
+            layer.dloss_doutput(&outputs.view(), &fixture.targets.view());
+        let dloss_dinputs =
+            layer.backward(&fixture.inputs.view(), &dloss_doutputs.view());
+        assert_relative_eq!(dloss_dinputs.view(), fixture.gradients.inputs.view());
     }
 
     #[test]
-    fn test_tanh_layer_single_node() {
-        let mut layer = FullyConnectedWithActivation::new_simple(TanhLayer::new());
-
-        let input = array![[1.0]];
-        let output = layer.forward(&input.view());
-        assert_eq!(output, array![[0.7615941559557649]]);
-
-        let target = array![[0.0]];
-        let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
-        // ∂loss/∂output = (2.0 / n) * (output - target)
-        //               = (2.0 / 1) * (0.7615941559557649 - 0.0)
-        assert_relative_eq!(dloss_doutput, array![[1.52318831191]], epsilon = 1e-10);
-
-        let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
-        layer.update_parameters(0.1);
-
-        // ∂loss/∂preactivation = ∂loss/∂output * ∂output/∂preactivation
-        //                      = 1.52318831191 * (1 - tanh^2(output))
-        //                      = 1.52318831191 * (1 - 0.7615941559557649^2)
-        //
-        // biases -= learning_rate * ∂loss/∂preactivation
-        // biases[0] = 0.0 - 0.1 * (1.52318831191 * (1 - 0.7615941559557649^2))
-        assert_relative_eq!(
-            layer.fully_connected.biases,
-            array![-0.06397000084],
-            epsilon = 1e-10
-        );
-
-        // weights -= learning_rate * ∂loss/∂preactivation * input
-        // weights[0] = 1.0 - 0.1 * (1.52318831191 * (1 - 0.7615941559557649^2)) * 1.0
-        assert_relative_eq!(
-            layer.fully_connected.weights,
-            array![[0.93602999915]],
-            epsilon = 1e-10
-        );
-
-        // ∂loss/∂input = ∂loss/∂preactivation * ∂preactivation/∂input
-        //              = (1.52318831191 * (1 - 0.7615941559557649^2)) * 1.0
-        assert_relative_eq!(dloss_dinput, array![[0.63970000844]], epsilon = 1e-10);
-    }
-
-    #[test]
-    fn test_softmax_layer_single_node() {
-        let mut layer = FullyConnectedWithActivation::new_simple(SoftmaxLayer::new());
-
-        let input = array![[1.0]];
-        let output = layer.forward(&input.view());
-        assert_eq!(output, array![[1.0]]);
-
-        let target = array![[0.0]];
-        let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
-        let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
-        layer.update_parameters(0.1);
-        assert_eq!(dloss_dinput, array![[1.0]]);
-        assert_eq!(layer.fully_connected.weights, array![[0.9]]);
-        assert_eq!(layer.fully_connected.biases, array![-0.1]);
-    }
-
-    #[test]
-    fn test_leaky_relu_layer() {
+    fn leaky_relu_matches_fixture() {
+        let json: &str = include_str!("../fixtures/layers/leaky_relu.json");
         let mut layer = LeakyReluLayer::new(0.01);
-        let input = array![[1.0, 0.0, -1.0], [2.0, 0.0, -2.0]];
-        let output = layer.forward(&input.view());
-        assert_eq!(output, array![[1.0, 0.0, -0.01], [2.0, 0.0, -0.02]]);
-
-        let dloss_doutput = array![[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]];
-        let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
-        assert_eq!(dloss_dinput, array![[1.0, 1.0, 0.01], [2.0, 2.0, 0.02]]);
+        assert_activation_layer_matches_fixture(&mut layer, json);
     }
 
     #[test]
-    fn test_softmax_layer() {
-        let mut fully_connected =
-            FullyConnectedLayer::new(InitializationType::Xavier, 3, 2);
-        fully_connected.weights = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
-        fully_connected.biases = array![1.0, 0.0];
-        let mut layer =
-            FullyConnectedWithActivation::new(fully_connected, SoftmaxLayer::new());
-
-        let input = array![[1.0, 2.0, 3.0]];
-        // 1*1 + 2*3 + 3*5 + 1 = 23
-        // 1*2 + 2*4 + 3*6 + 0 = 28
-        //
-        // e^23 / (e^23 + e^28) = 0.00669285092
-        // e^28 / (e^23 + e^28) = 0.99330714907
-        let output = layer.forward(&input.view());
-        assert_relative_eq!(
-            output,
-            array![[0.00669285092, 0.99330714907]],
-            epsilon = 1e-6
-        );
-
-        let target = array![[1.0, 0.0]];
-        let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
-        let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
-        layer.update_parameters(0.1);
-
-        // biases -= (output - target) * leaning_rate
-        // biases[0] = 1 - (0.00669285092 - 1) * 0.1 = 1.09933071491
-        // biases[1] = 0 - (0.99330714907 - 0) * 0.1 = -0.0993307149
-        assert_relative_eq!(
-            layer.fully_connected.biases,
-            array![1.09933071491, -0.0993307149],
-            epsilon = 1e-6
-        );
-
-        // weights -= (output - target) * input * learning_rate
-        // weights[0, 0] = 1 - (0.00669285092 - 1) * 1 * 0.1 = 1.09933071491
-        // weights[0, 1] = 2 - (0.99330714907 - 0) * 1 * 0.1 = 1.90066928509
-        // weights[1, 0] = 3 - (0.00669285092 - 1) * 2 * 0.1 = 3.19866142982
-        // weights[1, 1] = 4 - (0.99330714907 - 0) * 2 * 0.1 = 3.80133857019
-        // weights[2, 0] = 5 - (0.00669285092 - 1) * 3 * 0.1 = 5.29799214472
-        // weights[2, 1] = 6 - (0.99330714907 - 0) * 3 * 0.1 = 5.70200785528
-        assert_relative_eq!(
-            layer.fully_connected.weights,
-            array![
-                [1.09933071491, 1.90066928509],
-                [3.19866142982, 3.80133857019],
-                [5.29799214472, 5.70200785528],
-            ],
-            epsilon = 1e-6
-        );
-
-        // dloss_dinput = (output - target) * weights
-        // dloss_dinput[0] = (0.00669285092 - 1) * 1 + (0.99330714907 - 0) * 2 = 0.99330714906
-        // dloss_dinput[1] = (0.00669285092 - 1) * 3 + (0.99330714907 - 0) * 4 = 0.99330714904
-        // dloss_dinput[2] = (0.00669285092 - 1) * 5 + (0.99330714907 - 0) * 6 = 0.99330714902
-        assert_relative_eq!(
-            dloss_dinput,
-            array![[0.99330714906, 0.99330714904, 0.99330714902]],
-            epsilon = 1e-6
-        );
+    fn tanh_matches_fixture() {
+        let json: &str = include_str!("../fixtures/layers/tanh.json");
+        let mut layer = TanhLayer::new();
+        assert_activation_layer_matches_fixture(&mut layer, json);
     }
 
-    fn test_layer_gradient_numerically<L, M>(make_random_layer: M)
-    where
-        L: Layer + Clone,
-        M: Fn(usize, usize) -> FullyConnectedWithActivation<L>,
-    {
-        // We will generate a variety of random layers, compute the gradient,
-        // and then numerically estimate the gradient and compare the two. If
-        // more than 1% of the gradients are off, we will fail the test.
-        let iterations = 100;
-        let perturbation = 1e-6;
-        let epsilon = 1e-5;
-        let input_size = 10;
-        let output_size = 10;
+    #[test]
+    fn softmax_matches_fixture() {
+        let json: &str = include_str!("../fixtures/layers/softmax.json");
+        let mut layer = SoftmaxLayer::new();
+        assert_activation_layer_matches_fixture(&mut layer, json);
+    }
 
-        let mut tested = 0;
-        let mut failures = 0;
-        for _ in 0..iterations {
-            let mut layer = make_random_layer(input_size, output_size);
-            let input = Array::random((1, input_size), Uniform::new(-1.0, 1.0));
-            let target = Array::random((1, output_size), Uniform::new(0.0, 1.0));
-
-            let output = layer.forward(&input.view());
-            let loss = layer.loss(&output.view(), &target.view());
-
-            let dloss_doutput = layer.dloss_doutput(&output.view(), &target.view());
-            let dloss_dinput = layer.backward(&input.view(), &dloss_doutput.view());
-
-            // We will now numerically estimate the gradient of the loss
-            // function with respect to the weights. We will do this by
-            // computing the loss function for the weight matrix with each
-            // element perturbed by a small amount.
-            for i in 0..input.len() {
-                for j in 0..output.len() {
-                    let mut new_layer = layer.clone();
-                    new_layer.fully_connected.weights[[i, j]] += perturbation;
-                    let new_output = new_layer.forward(&input.view());
-                    let new_loss = new_layer.loss(&new_output.view(), &target.view());
-
-                    tested += 1;
-                    if !relative_eq!(
-                        new_loss,
-                        &loss
-                            + perturbation
-                                * new_layer.fully_connected.dloss_dweights[[i, j]],
-                        epsilon = epsilon,
-                    ) {
-                        warn!(
-                            "Updating weight from {} to {} updated loss from {} to {}",
-                            layer.fully_connected.weights[[i, j]],
-                            new_layer.fully_connected.weights[[i, j]],
-                            loss,
-                            new_loss,
-                        );
-                        failures += 1;
-                    }
-                }
-            }
-
-            // We will now numerically estimate the gradient of the loss
-            // function with respect to the biases. We will do this by
-            // computing the loss function for the bias vector with each
-            // element perturbed by a small amount.
-            for j in 0..output.len() {
-                let mut new_layer = layer.clone();
-                new_layer.fully_connected.biases[j] += perturbation;
-                let new_output = new_layer.forward(&input.view());
-                let new_loss = new_layer.loss(&new_output.view(), &target.view());
-
-                tested += 1;
-                if !relative_eq!(
-                    new_loss,
-                    &loss + perturbation * new_layer.fully_connected.dloss_dbiases[j],
-                    epsilon = epsilon,
-                ) {
-                    warn!(
-                        "Updating bias from {} to {} updated loss from {} to {}",
-                        layer.fully_connected.biases[j],
-                        new_layer.fully_connected.biases[j],
-                        loss,
-                        new_loss,
-                    );
-                    failures += 1;
-                }
-            }
-
-            // Finally, we will numerically estimate the gradient of the loss
-            // function with respect to the input. We will do this by
-            // computing the loss function for the input vector with each
-            // element perturbed by a small amount.
-            for i in 0..input.len() {
-                let mut new_input = input.clone();
-                new_input[[0, i]] += perturbation;
-                let new_output = layer.forward(&new_input.view());
-                let new_loss = layer.loss(&new_output.view(), &target.view());
-
-                tested += 1;
-                if !relative_eq!(
-                    new_loss,
-                    &loss + perturbation * dloss_dinput[[0, i]],
-                    epsilon = epsilon,
-                ) {
-                    warn!(
-                        "Updating input from {} to {} updated loss from {} to {}",
-                        input[[0, i]],
-                        new_input[[0, i]],
-                        loss,
-                        new_loss,
-                    );
-                    failures += 1;
-                }
-            }
-
-            // Check our total number of failures.
-            if failures as f32 > tested as f32 * 0.01 {
-                panic!("Too many failures: {}/{}", failures, tested);
-            }
+    #[test]
+    fn fully_connected_matches_fixture() {
+        #[derive(Debug, Deserialize)]
+        struct FullyConnectedGradients {
+            #[serde(deserialize_with = "deserialize_array2")]
+            inputs: Array2<f32>,
+            #[serde(deserialize_with = "deserialize_array2")]
+            weights: Array2<f32>,
+            #[serde(deserialize_with = "deserialize_array1")]
+            bias: Array1<f32>,
         }
+
+        #[derive(Debug, Deserialize)]
+        struct FullyConnectedFixture {
+            #[serde(deserialize_with = "deserialize_array2")]
+            inputs: Array2<f32>,
+            #[serde(deserialize_with = "deserialize_array2")]
+            weights: Array2<f32>,
+            #[serde(deserialize_with = "deserialize_array1")]
+            bias: Array1<f32>,
+            #[serde(deserialize_with = "deserialize_array2")]
+            outputs: Array2<f32>,
+            #[serde(deserialize_with = "deserialize_array2")]
+            targets: Array2<f32>,
+            gradients: FullyConnectedGradients,
+        }
+
+        let json: &str = include_str!("../fixtures/layers/fully_connected.json");
+        let fixture: FullyConnectedFixture = serde_json::from_str(json).unwrap();
+        let mut layer = FullyConnectedLayer::new(
+            InitializationType::Xavier,
+            fixture.inputs.ncols(),
+            fixture.outputs.ncols(),
+        );
+        layer.weights = fixture.weights.clone();
+        layer.biases = fixture.bias.clone();
+
+        let outputs = layer.forward(&fixture.inputs.view());
+        assert_relative_eq!(outputs, fixture.outputs);
+
+        let dloss_doutputs =
+            layer.dloss_doutput(&outputs.view(), &fixture.targets.view());
+        let dloss_dinputs =
+            layer.backward(&fixture.inputs.view(), &dloss_doutputs.view());
+        assert_relative_eq!(dloss_dinputs.view(), fixture.gradients.inputs.view());
+        assert_relative_eq!(layer.dloss_dbiases.view(), fixture.gradients.bias.view());
+        assert_relative_eq!(
+            layer.dloss_dweights.view(),
+            fixture.gradients.weights.view()
+        );
     }
 
     #[test]
-    fn test_tanh_layer_gradient_numerically() {
-        test_layer_gradient_numerically(|input_size, output_size| {
-            FullyConnectedWithActivation::new(
-                FullyConnectedLayer::new(
-                    InitializationType::Xavier,
-                    input_size,
-                    output_size,
-                ),
-                TanhLayer::new(),
-            )
-        });
+    fn conv_matches_fixture() {
+        let fixture = load_conv2d_fixture().unwrap();
+
+        let height = fixture.inputs.shape()[2];
+        let width = fixture.inputs.shape()[3];
+        let channels_in = fixture.inputs.shape()[1];
+        let channels_out = fixture.filters.shape()[0];
+        let kernel_size = fixture.filters.shape()[2];
+        let mut layer = ConvLayer::new(
+            InitializationType::Xavier,
+            height,
+            width,
+            channels_in,
+            channels_out,
+            kernel_size,
+        )
+        .expect("Failed to create ConvLayer");
+
+        layer.weights = fixture.filters.clone();
+        layer.biases = fixture.biases.clone();
+
+        let inputs = fixture
+            .inputs
+            .clone()
+            .into_shape((fixture.inputs.len_of(Axis(0)), channels_in * height * width))
+            .expect("Failed to reshape inputs");
+        let outputs = layer.forward(&inputs.view());
+        let expected_outputs = fixture
+            .outputs
+            .clone()
+            .into_shape((
+                fixture.outputs.len_of(Axis(0)),
+                channels_out * height * width,
+            ))
+            .expect("Failed to reshape outputs");
+        assert_relative_eq!(outputs, &expected_outputs, max_relative = 1e-5);
+
+        let targets = fixture
+            .targets
+            .clone()
+            .into_shape((
+                fixture.targets.len_of(Axis(0)),
+                channels_out * height * width,
+            ))
+            .expect("Failed to reshape targets");
+        let dloss_doutputs = layer.dloss_doutput(&outputs.view(), &targets.view());
+        assert_relative_eq!(
+            dloss_doutputs.view(),
+            fixture
+                .gradients
+                .outputs
+                .to_shape((
+                    fixture.gradients.outputs.len_of(Axis(0)),
+                    channels_out * height * width
+                ))
+                .unwrap(),
+            max_relative = 1e-5
+        );
+        let dloss_dinputs = layer.backward(&inputs.view(), &dloss_doutputs.view());
+        let expected_dloss_dinputs = fixture
+            .gradients
+            .inputs
+            .clone()
+            .into_shape((
+                fixture.gradients.inputs.len_of(Axis(0)),
+                channels_in * height * width,
+            ))
+            .expect("Failed to reshape dloss_dinputs");
+        assert_relative_eq!(
+            layer.dloss_dbiases.view(),
+            fixture.gradients.biases.view(),
+            max_relative = 1e-5
+        );
+        assert_relative_eq!(
+            layer.dloss_dweights.view(),
+            fixture.gradients.filters.view(),
+            max_relative = 1e-4
+        );
+        assert_relative_eq!(
+            dloss_dinputs.view(),
+            expected_dloss_dinputs.view(),
+            max_relative = 1e-5
+        );
     }
 
     #[test]
-    fn test_relu_layer_gradient_numerically() {
-        test_layer_gradient_numerically(|input_size, output_size| {
-            FullyConnectedWithActivation::new(
-                FullyConnectedLayer::new(
-                    InitializationType::He,
-                    input_size,
-                    output_size,
-                ),
-                LeakyReluLayer::new(0.01),
-            )
-        });
-    }
+    fn pool_matches_fixture() {
+        // {
+        //     "kernel_size": kernel_size,
+        //     "stride": stride,
+        //     "inputs": inputs.tolist(),
+        //     "outputs": outputs.tolist(),
+        //     "targets": targets.tolist(),
+        //     "gradients": {
+        //         "inputs": inputs.grad.tolist(),
+        //     },
+        // }
 
-    #[test]
-    fn test_softmax_gradient_numerically() {
-        test_layer_gradient_numerically(|input_size, output_size| {
-            FullyConnectedWithActivation::new(
-                FullyConnectedLayer::new(
-                    InitializationType::Xavier,
-                    input_size,
-                    output_size,
-                ),
-                SoftmaxLayer::new(),
-            )
-        });
+        #[derive(Debug, Deserialize)]
+        struct PoolGradients {
+            #[serde(deserialize_with = "deserialize_array4")]
+            inputs: Array4<f32>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct PoolFixture {
+            kernel_size: usize,
+            stride: usize,
+            #[serde(deserialize_with = "deserialize_array4")]
+            inputs: Array4<f32>,
+            #[serde(deserialize_with = "deserialize_array4")]
+            outputs: Array4<f32>,
+            #[serde(deserialize_with = "deserialize_array4")]
+            targets: Array4<f32>,
+            gradients: PoolGradients,
+        }
+
+        let json: &str = include_str!("../fixtures/layers/pool2d.json");
+        let fixture: PoolFixture = serde_json::from_str(json).unwrap();
+        let height = fixture.inputs.shape()[2];
+        let width = fixture.inputs.shape()[3];
+        let channels = fixture.inputs.shape()[1];
+        let mut layer = PoolLayer::new(
+            height,
+            width,
+            channels,
+            fixture.kernel_size,
+            fixture.stride,
+        );
+
+        let inputs = fixture
+            .inputs
+            .clone()
+            .into_shape((fixture.inputs.len_of(Axis(0)), channels * height * width))
+            .expect("Failed to reshape inputs");
+        let outputs = layer.forward(&inputs.view());
+        let out_height = fixture.outputs.shape()[2];
+        let out_width = fixture.outputs.shape()[3];
+        let expected_outputs = fixture
+            .outputs
+            .clone()
+            .into_shape((
+                fixture.outputs.len_of(Axis(0)),
+                channels * out_height * out_width,
+            ))
+            .expect("Failed to reshape outputs");
+        assert_relative_eq!(outputs, &expected_outputs);
+
+        let targets = fixture
+            .targets
+            .clone()
+            .into_shape((
+                fixture.targets.len_of(Axis(0)),
+                channels * out_height * out_width,
+            ))
+            .expect("Failed to reshape targets");
+        let dloss_doutputs = layer.dloss_doutput(&outputs.view(), &targets.view());
+        let dloss_dinputs = layer.backward(&inputs.view(), &dloss_doutputs.view());
+        let expected_dloss_dinputs = fixture
+            .gradients
+            .inputs
+            .clone()
+            .into_shape((
+                fixture.gradients.inputs.len_of(Axis(0)),
+                channels * height * width,
+            ))
+            .expect("Failed to reshape dloss_dinputs");
+        assert_relative_eq!(dloss_dinputs.view(), expected_dloss_dinputs.view());
     }
 }

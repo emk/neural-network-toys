@@ -23,6 +23,7 @@ use training::TrainAndTestData;
 
 mod csv_data;
 mod history;
+mod im2col;
 mod initialization;
 mod layers;
 mod network;
@@ -30,6 +31,8 @@ mod optimizers;
 mod plot;
 mod reshape;
 mod signals;
+#[cfg(test)]
+mod test_utils;
 mod training;
 mod ui;
 
@@ -77,12 +80,20 @@ struct MnistOpt {
     #[structopt(flatten)]
     train: TrainOpt,
 
+    /// Convolutional kernel size.
+    #[arg(long = "kernel-size", default_value = "5")]
+    kernel_size: usize,
+
+    /// Convolutional layer count.
+    #[arg(long = "conv-layers", default_value = "2")]
+    conv_layers: usize,
+
     /// Hidden layer size. This needs to be adjusted if you change the dropout.
     #[arg(long = "hidden-layer-width", default_value = "128")]
     hidden_layer_width: usize,
 
     /// Hidden layer count.
-    #[arg(long = "hidden-layers", default_value = "2")]
+    #[arg(long = "hidden-layers", default_value = "1")]
     hidden_layers: usize,
 }
 
@@ -143,7 +154,9 @@ fn train_mnist(opt: MnistOpt) -> Result<()> {
     };
 
     // Convert the MNIST data into normalized `[examples, features]` arrays.
-    let img_size = 28 * 28;
+    let img_height = 28;
+    let img_width = 28;
+    let img_size = img_height * img_width;
     let num_digits = 10;
     let train_and_test_data = TrainAndTestData {
         train_inputs: array2_f32_from_vec_u8(mnist.trn_img, img_size) / 255.0,
@@ -154,11 +167,37 @@ fn train_mnist(opt: MnistOpt) -> Result<()> {
 
     let mut network = Network::new(img_size);
     let activation = opt.train.activation();
-    network.add_fully_connected_layer(opt.hidden_layer_width, activation);
-    for _ in 1..opt.hidden_layers {
+
+    // Add the convolutional layers.
+    let mut channels_in = 1;
+    let mut layer_img_height = img_height;
+    let mut layer_img_width = img_width;
+    for _ in 0..opt.conv_layers {
+        let channels_out = if channels_in == 1 { 8 } else { channels_in * 2 };
+
+        network.add_conv_layer(
+            layer_img_height,
+            layer_img_width,
+            channels_in,
+            channels_out,
+            opt.kernel_size,
+            activation,
+        )?;
+        network.add_pool_layer(layer_img_height, layer_img_width, channels_out, 2, 2);
+        network.add_dropout_layer(1.0 - opt.train.dropout);
+
+        channels_in = channels_out;
+        layer_img_height /= opt.kernel_size;
+        layer_img_width /= opt.kernel_size;
+    }
+
+    // Add fully-connected hidden layers.
+    for _ in 0..opt.hidden_layers {
         network.add_fully_connected_layer(opt.hidden_layer_width, activation);
         network.add_dropout_layer(1.0 - opt.train.dropout);
     }
+
+    // Add the final output layer.
     network.add_fully_connected_layer(num_digits, ActivationFunction::Softmax);
 
     train("mnist", opt.train, &mut network, &train_and_test_data)
